@@ -15,12 +15,15 @@ if os.getenv("OPENAI_API_KEY_FOR_TRACE"):
 
 # ── Firebase Admin ──────────────────────────────────────────────
 if not firebase_admin._apps:
+    _pk = os.getenv("FIREBASE_PRIVATE_KEY")
+    if not _pk:
+        raise ValueError("FIREBASE_PRIVATE_KEY not set. Add it as a secret in your deployment platform.")
     cred = credentials.Certificate({
         "type": "service_account",
         "project_id": os.getenv("FIREBASE_PROJECT_ID"),
         "private_key_id": "1",
         "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-        "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n"),
+        "private_key": _pk.replace("\\n", "\n"),
         "client_id": "",
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
