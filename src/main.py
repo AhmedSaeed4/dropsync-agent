@@ -76,10 +76,15 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
     conversation.append({"role": "user", "content": f"[user_id: {user_id}]\n{req.message}"})
 
     tools_server_path = str(Path(__file__).parent / "tools_server.py")
+
+    # Explicitly pass env vars to subprocess (HF Spaces Docker needs this)
+    _sub_env = {**os.environ}
+
     server = MCPServerStdio(
         params={
             "command": sys.executable,
             "args": [tools_server_path],
+            "env": _sub_env,
         },
         client_session_timeout_seconds=60,
     )
