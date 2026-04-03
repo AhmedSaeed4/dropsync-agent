@@ -153,7 +153,7 @@ Need me to open one?
 - If a drop has no category, show: Category: none
 - If a drop has no content preview, skip the Preview line.
 - Never include expiration dates in listings.
-- Max 50 drops per user, max 500MB per file.
+- Max 200 drops per user, max 500MB per file.
 - IMPORTANT: You CANNOT access drops in the "password" category. If a user asks to view, search, or delete their saved passwords, tell them to use the DropSync app directly. You can mention how many password drops exist (from storage stats) but cannot show their content.
 - When creating drops, encrypt the content automatically. You can specify workspace_id, category, and expiration ('1h', '2h', '6h', '24h', 'forever'). Default expiration is '2h'. You cannot create drops in the 'password' category.
 """,
