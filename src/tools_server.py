@@ -21,6 +21,7 @@ from config import db
 from decrypt import decrypt_drop_content, encrypt_drop_content, b64e
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
+from difflib import SequenceMatcher
 import secrets
 import os
 
@@ -39,6 +40,29 @@ def _is_password_drop(d: dict) -> bool:
     return cat.lower() == "password"
 
 
+def _fuzzy_match(search: str, text: str, threshold: float = 0.6) -> bool:
+    """Fuzzy match search term against text. Checks full-string similarity AND word-level similarity,
+    so 'tuturial' matches 'My Tutorial Notes' via word 'Tutorial'."""
+    s = search.lower()
+    t = text.lower()
+
+    # Exact substring (fast path)
+    if s in t or t in s:
+        return True
+
+    # Full string similarity
+    if SequenceMatcher(None, s, t).ratio() >= threshold:
+        return True
+
+    # Word-level: check every search word against every text word
+    for sw in s.split():
+        for tw in t.split():
+            if SequenceMatcher(None, sw, tw).ratio() >= threshold:
+                return True
+
+    return False
+
+
 def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
     """Format a drop for display."""
     return (
@@ -52,19 +76,50 @@ def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
     )
 
 
+def _get_user_workspace_ids(user_id: str) -> list[str]:
+    """Get IDs of all workspaces the user is a member of."""
+    docs = db.collection("workspaces").where("members", "array_contains", user_id).stream()
+    return [doc.id for doc in docs]
+
+
+def _get_all_accessible_drops(user_id: str) -> list:
+    """Get all drops a user can access: personal drops + drops from all joined workspaces.
+    Deduplicates by document ID."""
+    seen_ids = set()
+    all_docs = []
+
+    # 1. Personal drops (userId == me AND workspaceId == null)
+    for doc in db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).stream():
+        if doc.id not in seen_ids:
+            seen_ids.add(doc.id)
+            all_docs.append(doc)
+
+    # 2. Workspace drops — no userId filter, all members see all drops
+    for ws_id in _get_user_workspace_ids(user_id):
+        for doc in db.collection("drops").where("workspaceId", "==", ws_id).stream():
+            if doc.id not in seen_ids:
+                seen_ids.add(doc.id)
+                all_docs.append(doc)
+
+    return all_docs
+
+
 # ── Tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
 def list_drops(user_id: str, workspace_id: str | None = None) -> str:
-    """List all drops for a user. Optionally filter by workspace.
-    Returns drop names, types, sizes, expiration, category, and decrypted content preview.
+    """List drops for a user, optionally filtered by workspace.
+    - No workspace_id (None): returns personal drops only (workspaceId == null).
+    - With workspace_id: returns ALL drops in that workspace from ALL members.
     Password-category drops are excluded."""
-    query = db.collection("drops").where("userId", "==", user_id)
 
     if workspace_id:
-        query = query.where("workspaceId", "==", workspace_id)
+        # Workspace drops — no userId filter, all members see all drops
+        docs = db.collection("drops").where("workspaceId", "==", workspace_id).stream()
+    else:
+        # Personal drops only (userId + workspaceId == null)
+        docs = db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).stream()
 
-    docs = query.stream()
     drops = []
     for doc in docs:
         d = doc.to_dict()
@@ -90,31 +145,52 @@ def list_drops(user_id: str, workspace_id: str | None = None) -> str:
 @mcp.tool()
 def search_drops(user_id: str, query: str) -> str:
     """Search drops by name, text content, or category. Searches through decrypted content too.
+    Uses fuzzy matching — handles typos like 'tuturial' matching 'tutorial'.
+    Searches across personal drops AND all workspace drops the user has access to.
     Password-category drops are excluded from results."""
-    docs = db.collection("drops").where("userId", "==", user_id).stream()
-    results = []
+
+    exact_results = []
+    fuzzy_results = []
     query_lower = query.lower()
 
-    for doc in docs:
+    for doc in _get_all_accessible_drops(user_id):
         d = doc.to_dict()
 
         # Skip password-category drops
         if _is_password_drop(d):
             continue
 
-        name = d.get("name", "").lower()
-        category = (d.get("category") or "").lower()
+        name = d.get("name", "")
+        category = d.get("category") or ""
 
         # Decrypt content to search through it
         decrypted_content = ""
         if d.get("type") == "text" and d.get("content"):
             decrypted = decrypt_drop_content(user_id, d)
             if decrypted:
-                decrypted_content = decrypted.lower()
+                decrypted_content = decrypted
 
-        if query_lower in name or query_lower in decrypted_content or query_lower in category:
-            content_preview = f", content=\"{decrypted_content[:60]}\"" if decrypted_content else ""
-            results.append(_format_drop(doc.id, d, content_preview))
+        content_preview = f', content="{decrypted_content[:60]}"' if decrypted_content else ""
+
+        # Pass 1: exact substring match (fast)
+        if query_lower in name.lower() or query_lower in decrypted_content.lower() or query_lower in category.lower():
+            exact_results.append(_format_drop(doc.id, d, content_preview))
+        # Pass 2: fuzzy match on name and category
+        elif _fuzzy_match(query, name) or _fuzzy_match(query, category):
+            fuzzy_results.append(_format_drop(doc.id, d, content_preview))
+
+    # Prefer exact matches, append fuzzy as "did you mean?"
+    output_parts = []
+    if exact_results:
+        output_parts.append("\n".join(exact_results))
+    if fuzzy_results and not exact_results:
+        output_parts.append(f"No exact matches for '{query}', but found similar:\n" + "\n".join(fuzzy_results))
+    elif fuzzy_results:
+        output_parts.append(f"\n\nAlso similar to '{query}':\n" + "\n".join(fuzzy_results))
+
+    if not output_parts:
+        return f"No drops matching '{query}'. Try listing your drops to see what's available."
+    return "\n".join(output_parts)
 
     if not results:
         return f"No drops matching '{query}'."
@@ -123,7 +199,8 @@ def search_drops(user_id: str, query: str) -> str:
 
 @mcp.tool()
 def get_drop(user_id: str, drop_id: str) -> str:
-    """Get full details for a specific drop, including decrypted content. Only returns drops owned by the user.
+    """Get full details for a specific drop, including decrypted content.
+    For personal drops: only the owner can access. For workspace drops: any member can access.
     Password-category drops cannot be accessed."""
     doc = db.collection("drops").document(drop_id).get()
 
@@ -131,8 +208,18 @@ def get_drop(user_id: str, drop_id: str) -> str:
         return f"Drop {drop_id} not found."
 
     d = doc.to_dict()
-    if d.get("userId") != user_id:
-        return "Access denied — this drop belongs to another user."
+
+    # Access control: personal drops require ownership, workspace drops require membership
+    ws_id = d.get("workspaceId")
+    if ws_id:
+        # Workspace drop — verify membership
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
+            return "Access denied — you are not a member of this workspace."
+    else:
+        # Personal drop — must be owner
+        if d.get("userId") != user_id:
+            return "Access denied — this drop belongs to another user."
 
     if _is_password_drop(d):
         return PASSWORD_DENIED
@@ -162,7 +249,8 @@ def get_drop(user_id: str, drop_id: str) -> str:
 
 @mcp.tool()
 def delete_drop(user_id: str, drop_id: str) -> str:
-    """Delete a drop. Only the owner can delete their own drops.
+    """Delete a drop.
+    For personal drops: only the owner can delete. For workspace drops: any member can delete.
     Password-category drops cannot be deleted through the agent."""
     doc_ref = db.collection("drops").document(drop_id)
     doc = doc_ref.get()
@@ -171,8 +259,16 @@ def delete_drop(user_id: str, drop_id: str) -> str:
         return f"Drop {drop_id} not found."
 
     d = doc.to_dict()
-    if d.get("userId") != user_id:
-        return "Access denied — you can only delete your own drops."
+
+    # Access control: personal drops require ownership, workspace drops require membership
+    ws_id = d.get("workspaceId")
+    if ws_id:
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
+            return "Access denied — you are not a member of this workspace."
+    else:
+        if d.get("userId") != user_id:
+            return "Access denied — you can only delete your own drops."
 
     if _is_password_drop(d):
         return PASSWORD_DENIED
@@ -183,10 +279,13 @@ def delete_drop(user_id: str, drop_id: str) -> str:
 
 @mcp.tool()
 def list_workspaces(user_id: str) -> str:
-    """List all workspaces the user is a member of."""
+    """List all workspaces the user has access to, including their personal space.
+    Returns personal space first, then all shared workspaces."""
+
+    workspaces = ["- Personal Space (your private drops, workspace_id=None)"]
+
     docs = db.collection("workspaces").where("members", "array_contains", user_id).stream()
 
-    workspaces = []
     for doc in docs:
         d = doc.to_dict()
         role = "owner" if d.get("ownerId") == user_id else "member"
@@ -198,15 +297,13 @@ def list_workspaces(user_id: str) -> str:
             f"id={doc.id})"
         )
 
-    if not workspaces:
-        return "No workspaces found."
     return "\n".join(workspaces)
 
 
 @mcp.tool()
 def get_storage_stats(user_id: str) -> str:
-    """Get storage stats: total drops, total size, drops by type. Password drops are counted but content is not shown."""
-    docs = db.collection("drops").where("userId", "==", user_id).stream()
+    """Get storage stats across personal drops and all workspace drops the user has access to.
+    Password drops are counted but content is not shown. Includes per-workspace breakdown."""
 
     total_drops = 0
     total_size = 0
@@ -214,8 +311,10 @@ def get_storage_stats(user_id: str) -> str:
     text_count = 0
     encrypted_count = 0
     password_count = 0
+    personal_count = 0
+    workspace_counts: dict[str, int] = {}  # workspace_id -> count
 
-    for doc in docs:
+    for doc in _get_all_accessible_drops(user_id):
         d = doc.to_dict()
         total_drops += 1
         total_size += d.get("fileSize", 0) or 0
@@ -228,12 +327,26 @@ def get_storage_stats(user_id: str) -> str:
         if _is_password_drop(d):
             password_count += 1
 
+        ws_id = d.get("workspaceId")
+        if ws_id:
+            workspace_counts[ws_id] = workspace_counts.get(ws_id, 0) + 1
+        else:
+            personal_count += 1
+
+    # Build per-workspace breakdown with names
+    breakdown_lines = [f"  Personal: {personal_count}"]
+    for ws_id, count in workspace_counts.items():
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        ws_name = ws_doc.to_dict().get("name", ws_id) if ws_doc.exists else ws_id
+        breakdown_lines.append(f"  {ws_name}: {count}")
+
     return (
         f"Total drops: {total_drops}\n"
         f"Files: {file_count} | Text: {text_count}\n"
         f"Encrypted: {encrypted_count}\n"
         f"Password-protected: {password_count} (hidden from AI)\n"
         f"Total size: {total_size / (1024*1024):.2f} MB\n"
+        f"Breakdown:\n" + "\n".join(breakdown_lines) + "\n"
         f"Capacity: {total_drops}/50 drops"
     )
 
