@@ -347,7 +347,7 @@ def get_storage_stats(user_id: str) -> str:
         f"Password-protected: {password_count} (hidden from AI)\n"
         f"Total size: {total_size / (1024*1024):.2f} MB\n"
         f"Breakdown:\n" + "\n".join(breakdown_lines) + "\n"
-        f"Capacity: {total_drops}/50 drops"
+        f"Capacity: {total_drops}/200 drops"
     )
 
 
@@ -375,10 +375,10 @@ def create_drop(
     if category and category.lower() == "password":
         return PASSWORD_DENIED
 
-    # Check drop limit (max 50)
-    existing = list(db.collection("drops").where("userId", "==", user_id).limit(51).stream())
-    if len(existing) >= 50:
-        return "Cannot create drop — you've reached the 50 drop limit. Delete some drops first."
+    # Check drop limit (max 200)
+    existing = list(db.collection("drops").where("userId", "==", user_id).limit(201).stream())
+    if len(existing) >= 200:
+        return "Cannot create drop — you've reached the 200 drop limit. Delete some drops first."
 
     # Calculate expiration
     valid_expirations = ("1h", "2h", "6h", "24h", "forever")
