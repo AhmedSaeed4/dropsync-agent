@@ -16,8 +16,11 @@ AI-powered backend for [DropSync](https://github.com/AhmedSaeed4/dropsync) — a
 - Chat with your drops using natural language
 - Create, search, list, and delete text drops through AI
 - Create shared workspaces with auto-generated invite codes
+- Fuzzy search — handles typos and misspellings when searching drops
+- Separate personal vs workspace query paths with proper access control
 - All drops are end-to-end encrypted (AES-256-GCM)
 - Password-category drops are protected by a two-layer guardrail (input guardrail + tool-level block)
+- Up to 200 drops per user with per-workspace breakdowns
 
 ## Tech Stack
 
