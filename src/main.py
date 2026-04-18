@@ -116,7 +116,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "openai/gpt-oss-120b"}
+    return {"status": "ok", "model": "kimi-k2.5"}
 
 
 if __name__ == "__main__":

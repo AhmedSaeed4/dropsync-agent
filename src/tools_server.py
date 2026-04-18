@@ -65,13 +65,21 @@ def _fuzzy_match(search: str, text: str, threshold: float = 0.6) -> bool:
 
 def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
     """Format a drop for display."""
+    image_info = ""
+    if d.get("imageR2Key"):
+        size = d.get("imageSize", 0) or 0
+        if size >= 1024 * 1024:
+            size_str = f"{size / (1024*1024):.1f}MB"
+        else:
+            size_str = f"{size / 1024:.0f}KB"
+        image_info = f", has_image={size_str}"
     return (
         f"- {d.get('name', 'untitled')} "
         f"(type={d.get('type', '?')}, "
         f"encrypted={d.get('encrypted', False)}, "
         f"category={d.get('category', 'none')}, "
         f"expires={d.get('expiresAt', 'never')}"
-        f"{content_preview}, "
+        f"{content_preview}{image_info}, "
         f"id={doc_id})"
     )
 
@@ -234,6 +242,15 @@ def get_drop(user_id: str, drop_id: str) -> str:
         f"Size: {d.get('fileSize', 'N/A')} bytes",
     ]
 
+    # Show image attachment info
+    if d.get("imageR2Key"):
+        img_size = d.get("imageSize", 0) or 0
+        if img_size >= 1024 * 1024:
+            img_size_str = f"{img_size / (1024*1024):.1f}MB"
+        else:
+            img_size_str = f"{img_size / 1024:.0f}KB"
+        lines.append(f"Image attached: {img_size_str} {d.get('imageMimeType', 'image/*')}")
+
     # Decrypt and show content
     if d.get("type") == "text" and d.get("content"):
         decrypted = decrypt_drop_content(user_id, d)
@@ -309,6 +326,7 @@ def get_storage_stats(user_id: str) -> str:
     total_size = 0
     file_count = 0
     text_count = 0
+    text_with_image_count = 0
     encrypted_count = 0
     password_count = 0
     personal_count = 0
@@ -318,6 +336,10 @@ def get_storage_stats(user_id: str) -> str:
         d = doc.to_dict()
         total_drops += 1
         total_size += d.get("fileSize", 0) or 0
+        # Count image attachment storage for text drops
+        if d.get("imageR2Key"):
+            total_size += d.get("imageSize", 0) or 0
+            text_with_image_count += 1
         if d.get("type") == "file":
             file_count += 1
         else:
@@ -342,7 +364,7 @@ def get_storage_stats(user_id: str) -> str:
 
     return (
         f"Total drops: {total_drops}\n"
-        f"Files: {file_count} | Text: {text_count}\n"
+        f"Files: {file_count} | Text: {text_count} ({text_with_image_count} with images)\n"
         f"Encrypted: {encrypted_count}\n"
         f"Password-protected: {password_count} (hidden from AI)\n"
         f"Total size: {total_size / (1024*1024):.2f} MB\n"
