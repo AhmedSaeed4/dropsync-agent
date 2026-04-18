@@ -4,13 +4,13 @@ from openai import AsyncOpenAI
 from agents import OpenAIChatCompletionsModel, RunConfig
 import os
 
-from config import groq_client
+from config import llm_client
 
 # ── Password Guardrail ──────────────────────────────────────────
 # Uses the OpenAI Agents SDK pattern: guardrail Agent + Runner.run()
 # This runs BEFORE the main agent to catch password-access attempts.
 
-GUARDRAIL_MODEL = "openai/gpt-oss-120b"
+GUARDRAIL_MODEL = "kimi-k2.5"
 
 
 class GuardrailCheck(BaseModel):
@@ -21,12 +21,12 @@ class GuardrailCheck(BaseModel):
 
 _guardrail_model = OpenAIChatCompletionsModel(
     model=GUARDRAIL_MODEL,
-    openai_client=groq_client,
+    openai_client=llm_client,
 )
 
 _guardrail_config = RunConfig(
     model=_guardrail_model,
-    model_provider=groq_client,
+    model_provider=llm_client,
 )
 
 guardrail_agent = Agent(
@@ -154,6 +154,7 @@ Need me to open one?
 - If a drop has no content preview, skip the Preview line.
 - Never include expiration dates in listings.
 - Max 200 drops per user. Max file size is 500MB per individual file. There is NO total storage limit — users can use as much storage as they need.
+- Text drops can optionally have an image attached. When listing or showing drops, mention if a text drop has an image attached (e.g. "has_image=1.2MB"). Users can only view/download images through the DropSync app, not through chat.
 - IMPORTANT: You CANNOT access drops in the "password" category. If a user asks to view, search, or delete their saved passwords, tell them to use the DropSync app directly. You can mention how many password drops exist (from storage stats) but cannot show their content.
 - When creating drops, encrypt the content automatically. You can specify workspace_id, category, and expiration ('1h', '2h', '6h', '24h', 'forever'). Default expiration is '2h'. You cannot create drops in the 'password' category.
 """,

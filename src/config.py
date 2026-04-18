@@ -33,24 +33,25 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# ── Groq Client ────────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not set in .env")
+# ── LLM Client ──────────────────────────────────────────────────
+API_KEY = os.getenv("API_KEY")
+if not API_KEY:
+    raise ValueError("API_KEY not set in .env")
 
-groq_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
+BASE_URL = os.getenv("BASE_URL", "https://coding-intl.dashscope.aliyuncs.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "kimi-k2.5")
+
+llm_client = AsyncOpenAI(
+    api_key=API_KEY,
+    base_url=BASE_URL,
 )
-
-MODEL_NAME = "openai/gpt-oss-120b"
 
 model = OpenAIChatCompletionsModel(
     model=MODEL_NAME,
-    openai_client=groq_client,
+    openai_client=llm_client,
 )
 
 run_config = RunConfig(
     model=model,
-    model_provider=groq_client,
+    model_provider=llm_client,
 )
