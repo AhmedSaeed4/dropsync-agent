@@ -18,10 +18,17 @@ if _this_dir not in sys.path:
 from mcp.server.fastmcp import FastMCP
 
 from config import db
-from decrypt import decrypt_drop_content, encrypt_drop_content, b64e
+from decrypt import decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.ec import ECDH
+from cryptography.hazmat.primitives.serialization import (
+    load_der_private_key,
+    load_der_public_key,
+)
 from difflib import SequenceMatcher
+import json
 import secrets
 import os
 
@@ -40,31 +47,74 @@ def _is_password_drop(d: dict) -> bool:
     return cat.lower() == "password"
 
 
-def _fuzzy_match(search: str, text: str, threshold: float = 0.6) -> bool:
-    """Fuzzy match search term against text. Checks full-string similarity AND word-level similarity,
-    so 'tuturial' matches 'My Tutorial Notes' via word 'Tutorial'."""
-    s = search.lower()
-    t = text.lower()
+def _score_query(query: str, name: str, category: str, content: str) -> float:
+    """Score a drop against a multi-token query. Returns 0.0 for no match.
+    Higher score = better match. Name matches weigh most, then category, then content."""
+    tokens = query.lower().split()
+    if not tokens:
+        return 0.0
 
-    # Exact substring (fast path)
-    if s in t or t in s:
-        return True
+    name_lower = name.lower()
+    cat_lower = (category or "").lower()
+    content_lower = (content or "")[:300].lower()  # Only scan first 300 chars
 
-    # Full string similarity
-    if SequenceMatcher(None, s, t).ratio() >= threshold:
-        return True
+    total_score = 0.0
+    max_possible = len(tokens) * 3.0  # 3 fields * max weight
 
-    # Word-level: check every search word against every text word
-    for sw in s.split():
-        for tw in t.split():
-            if SequenceMatcher(None, sw, tw).ratio() >= threshold:
-                return True
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        token_score = 0.0
 
-    return False
+        # NAME: exact substring = 1.0, fuzzy = up to 0.9
+        if token in name_lower:
+            token_score = max(token_score, 1.0)
+        elif len(name_lower) > 0:
+            # Full string fuzzy
+            name_ratio = SequenceMatcher(None, token, name_lower).ratio()
+            token_score = max(token_score, name_ratio * 0.9)
+            # Word-level fuzzy
+            for nw in name_lower.split():
+                word_ratio = SequenceMatcher(None, token, nw).ratio()
+                if word_ratio >= 0.65:
+                    token_score = max(token_score, word_ratio * 0.85)
+
+        # CATEGORY: exact = 0.9, fuzzy = up to 0.8
+        if cat_lower and token in cat_lower:
+            token_score = max(token_score, 0.9)
+        elif cat_lower:
+            cat_ratio = SequenceMatcher(None, token, cat_lower).ratio()
+            token_score = max(token_score, cat_ratio * 0.8)
+
+        # CONTENT: exact = 0.7, fuzzy = up to 0.6
+        if content_lower and token in content_lower:
+            token_score = max(token_score, 0.7)
+        elif content_lower:
+            # Only fuzzy-match content if token is at least 3 chars (avoid noise)
+            if len(token) >= 3:
+                for cw in content_lower.split()[:50]:  # First 50 words only
+                    cw_ratio = SequenceMatcher(None, token, cw).ratio()
+                    if cw_ratio >= 0.7:
+                        token_score = max(token_score, cw_ratio * 0.6)
+                        break
+
+        total_score += token_score
+
+    if total_score <= 0:
+        return 0.0
+    return total_score / max_possible
+
+
+def _get_workspace_name(ws_id: str) -> str:
+    """Get workspace name from ID. Returns the ID if not found."""
+    ws = db.collection("workspaces").document(ws_id).get()
+    if ws.exists:
+        return ws.to_dict().get("name", ws_id)
+    return ws_id
 
 
 def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
-    """Format a drop for display."""
+    """Format a drop for display. Shows workspace name (ID) if not personal."""
     image_info = ""
     if d.get("imageR2Key"):
         size = d.get("imageSize", 0) or 0
@@ -73,6 +123,8 @@ def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
         else:
             size_str = f"{size / 1024:.0f}KB"
         image_info = f", has_image={size_str}"
+    ws_id = d.get("workspaceId")
+    ws_info = f"workspace={_get_workspace_name(ws_id)}({ws_id})" if ws_id else "workspace=Personal"
     return (
         f"- {d.get('name', 'untitled')} "
         f"(type={d.get('type', '?')}, "
@@ -80,6 +132,8 @@ def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
         f"category={d.get('category', 'none')}, "
         f"expires={d.get('expiresAt', 'never')}"
         f"{content_preview}{image_info}, "
+        f"workspace_id={ws_id or 'null'}, "
+        f"{ws_info}, "
         f"id={doc_id})"
     )
 
@@ -121,7 +175,8 @@ def list_drops(user_id: str, workspace_id: str | None = None) -> str:
     - With workspace_id: returns ALL drops in that workspace from ALL members.
     Password-category drops are excluded."""
 
-    if workspace_id:
+    # Handle case where model passes "None" as a string
+    if workspace_id and workspace_id.lower() != "none":
         # Workspace drops — no userId filter, all members see all drops
         docs = db.collection("drops").where("workspaceId", "==", workspace_id).stream()
     else:
@@ -153,13 +208,12 @@ def list_drops(user_id: str, workspace_id: str | None = None) -> str:
 @mcp.tool()
 def search_drops(user_id: str, query: str) -> str:
     """Search drops by name, text content, or category. Searches through decrypted content too.
-    Uses fuzzy matching — handles typos like 'tuturial' matching 'tutorial'.
+    Uses scoring and ranking — handles typos like 'bilal disord' matching 'AWS bilal'.
     Searches across personal drops AND all workspace drops the user has access to.
     Password-category drops are excluded from results."""
 
-    exact_results = []
-    fuzzy_results = []
-    query_lower = query.lower()
+    scored_results: list[tuple[float, str]] = []  # (score, formatted_string)
+    query_lower = query.lower().strip()
 
     for doc in _get_all_accessible_drops(user_id):
         d = doc.to_dict()
@@ -178,31 +232,28 @@ def search_drops(user_id: str, query: str) -> str:
             if decrypted:
                 decrypted_content = decrypted
 
-        content_preview = f', content="{decrypted_content[:60]}"' if decrypted_content else ""
+        score = _score_query(query_lower, name, category, decrypted_content)
 
-        # Pass 1: exact substring match (fast)
-        if query_lower in name.lower() or query_lower in decrypted_content.lower() or query_lower in category.lower():
-            exact_results.append(_format_drop(doc.id, d, content_preview))
-        # Pass 2: fuzzy match on name and category
-        elif _fuzzy_match(query, name) or _fuzzy_match(query, category):
-            fuzzy_results.append(_format_drop(doc.id, d, content_preview))
+        # Minimum threshold: at least one token must match something
+        tokens = query_lower.split()
+        if score > 0.05:
+            content_preview = f', content="{decrypted_content[:60]}"' if decrypted_content else ""
+            scored_results.append((score, _format_drop(doc.id, d, content_preview)))
 
-    # Prefer exact matches, append fuzzy as "did you mean?"
-    output_parts = []
-    if exact_results:
-        output_parts.append("\n".join(exact_results))
-    if fuzzy_results and not exact_results:
-        output_parts.append(f"No exact matches for '{query}', but found similar:\n" + "\n".join(fuzzy_results))
-    elif fuzzy_results:
-        output_parts.append(f"\n\nAlso similar to '{query}':\n" + "\n".join(fuzzy_results))
-
-    if not output_parts:
+    if not scored_results:
         return f"No drops matching '{query}'. Try listing your drops to see what's available."
-    return "\n".join(output_parts)
 
-    if not results:
-        return f"No drops matching '{query}'."
-    return "\n".join(results)
+    # Sort by score descending, return top 10
+    scored_results.sort(key=lambda x: -x[0])
+    top_results = scored_results[:10]
+
+    output_parts = []
+    if top_results[0][0] < 0.3:
+        output_parts.append(f"No exact matches for '{query}', but found similar:")
+    for score, formatted in top_results:
+        output_parts.append(formatted)
+
+    return "\n".join(output_parts)
 
 
 @mcp.tool()
@@ -235,6 +286,7 @@ def get_drop(user_id: str, drop_id: str) -> str:
     lines = [
         f"Name: {d.get('name', 'untitled')}",
         f"Type: {d.get('type', '?')}",
+        f"Workspace: {_get_workspace_name(ws_id)} ({ws_id})" if ws_id else "Workspace: Personal",
         f"Encrypted: {d.get('encrypted', False)}",
         f"Category: {d.get('category', 'none')}",
         f"Created: {d.get('createdAt', '?')}",
@@ -292,6 +344,31 @@ def delete_drop(user_id: str, drop_id: str) -> str:
 
     doc_ref.delete()
     return f"Deleted drop '{d.get('name', drop_id)}'."
+
+
+@mcp.tool()
+def preview_drop(user_id: str, drop_id: str) -> str:
+    """Get the drop ID and workspace ID needed to open a drop in the UI preview.
+    Use this when the user asks to open, preview, or show a specific drop.
+    Returns the drop details needed for the UI to open it."""
+    doc = db.collection("drops").document(drop_id).get()
+    if not doc.exists:
+        return f"Drop {drop_id} not found."
+
+    d = doc.to_dict()
+
+    # Access control
+    ws_id = d.get("workspaceId")
+    if ws_id:
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
+            return "Access denied — you're not a member of this workspace."
+    else:
+        if d.get("userId") != user_id:
+            return "Access denied — you can only preview your own drops."
+
+    ws_name = _get_workspace_name(ws_id) if ws_id else "Personal"
+    return f"I'll open '{d.get('name', drop_id)}' for you."
 
 
 @mcp.tool()
@@ -379,7 +456,7 @@ def create_drop(
     name: str,
     content: str,
     workspace_id: str | None = None,
-    category: str | None = None,
+    categories: str | None = None,
     expiration: str = "2h",
 ) -> str:
     """Create a new text drop. The content will be encrypted automatically.
@@ -389,13 +466,23 @@ def create_drop(
         name: Title for the drop.
         content: Text content for the drop.
         workspace_id: Optional workspace ID. If provided, creates in that workspace.
-        category: Optional category (e.g. 'anime', 'link'). Cannot be 'password'.
+        categories: Comma-separated list of up to 3 categories (e.g. 'anime,notes'). Cannot include 'password'.
         expiration: When the drop expires. Options: '1h', '2h', '6h', '24h', 'forever'. Default: '2h'.
     Returns confirmation with the drop ID or an error message.
     """
-    # Block password category
-    if category and category.lower() == "password":
-        return PASSWORD_DENIED
+    # Handle case where model passes "None" as a string
+    if workspace_id and workspace_id.lower() == "none":
+        workspace_id = None
+
+    # Parse categories from comma-separated string
+    category_list = []
+    if categories:
+        category_list = [c.strip() for c in categories.split(",") if c.strip()]
+        if len(category_list) > 3:
+            category_list = category_list[:3]
+        for cat in category_list:
+            if cat.lower() == "password":
+                return PASSWORD_DENIED
 
     # Check drop limit (max 200)
     existing = list(db.collection("drops").where("userId", "==", user_id).limit(201).stream())
@@ -414,30 +501,30 @@ def create_drop(
         hours = int(expiration.replace("h", ""))
         expires_at = now + timedelta(hours=hours)
 
-    # Auto-create category if it doesn't exist (case-insensitive check)
-    if category:
-        category = category.strip()
-        category_lower = category.lower()
-        # Built-in categories don't need a Firestore document
-        if category_lower not in BUILT_IN_CATEGORIES:
-            cat_docs = list(db.collection("categories").where("workspaceId", "==", workspace_id).limit(100).stream())
-            existing_cat = None
-            for doc in cat_docs:
-                doc_name = doc.to_dict().get("name", "")
-                if doc_name.lower() == category_lower:
-                    existing_cat = doc_name
-                    break
-            if existing_cat:
-                category = existing_cat
+    # Resolve categories — auto-create if they don't exist
+    resolved_categories: list[str] = []
+    if category_list:
+        cat_docs = list(db.collection("categories").where("workspaceId", "==", workspace_id).limit(100).stream())
+        existing_names = {doc.to_dict().get("name", "").lower(): doc.to_dict().get("name") for doc in cat_docs}
+
+        for cat in category_list:
+            cat_stripped = cat.strip()
+            cat_lower = cat_stripped.lower()
+            if not cat_lower:
+                continue
+            if cat_lower in BUILT_IN_CATEGORIES:
+                resolved_categories.append(cat_lower)
+            elif cat_lower in existing_names:
+                resolved_categories.append(existing_names[cat_lower])
             else:
+                # Create new category
                 db.collection("categories").add({
-                    "name": category,
+                    "name": cat_lower,
                     "workspaceId": workspace_id,
                     "createdBy": user_id,
                     "createdAt": firestore.SERVER_TIMESTAMP,
                 })
-        else:
-            category = category_lower
+                resolved_categories.append(cat_lower)
 
     # Encrypt content
     encrypted_fields = encrypt_drop_content(user_id, content, workspace_id)
@@ -454,7 +541,8 @@ def create_drop(
         "expiresAt": expires_at,
         "expirationOption": expiration,
         "workspaceId": workspace_id,
-        "category": category or None,
+        "categories": resolved_categories if resolved_categories else [],
+        "category": resolved_categories[0] if resolved_categories else None,  # Keep legacy field for backward compat
     }
 
     # Add encryption fields
@@ -469,7 +557,7 @@ def create_drop(
 
     return (
         f"Created drop '{name}' (id={doc_ref[1].id})\n"
-        f"Type: text | Category: {category or 'none'} | Expires: {expiration}\n"
+        f"Type: text | Categories: {', '.join(resolved_categories) if resolved_categories else 'none'} | Expires: {expiration}\n"
         f"Workspace: {workspace_id or 'personal'}"
     )
 
@@ -550,6 +638,275 @@ def create_workspace(user_id: str, name: str) -> str:
         f"Invite code: {invite_code}\n"
         f"You are the owner. Share the invite code to let others join."
     )
+
+
+@mcp.tool()
+def join_workspace(user_id: str, invite_code: str) -> str:
+    """Join a workspace using an invite code.
+    Returns the workspace details or an error if the code is invalid or you're already a member.
+    """
+    invite_code = invite_code.strip().upper()
+    if not invite_code:
+        return "Invite code cannot be empty."
+
+    # Find workspace by invite code
+    docs = list(db.collection("workspaces").where("inviteCode", "==", invite_code).limit(1).stream())
+    if not docs:
+        return "Invalid invite code. Please check the code and try again."
+
+    ws_doc = docs[0]
+    ws_data = ws_doc.to_dict()
+
+    # Check if already a member
+    members = ws_data.get("members", [])
+    if user_id in members:
+        return f"You're already a member of '{ws_data.get('name', 'unnamed')}' workspace."
+
+    # Add user to members
+    updated_members = members + [user_id]
+    db.collection("workspaces").document(ws_doc.id).update({
+        "members": updated_members
+    })
+
+    return (
+        f"Joined workspace '{ws_data.get('name', 'unnamed')}' (id={ws_doc.id}).\n"
+        f"Members: {len(updated_members)} | Owner: {ws_data.get('ownerId', '?')}"
+    )
+
+
+@mcp.tool()
+def list_categories(user_id: str, workspace_id: str | None = None) -> str:
+    """List categories for a user, optionally filtered by workspace.
+    Shows how many drops use each category so you can tell which are empty.
+    - No workspace_id: returns personal categories only.
+    - With workspace_id: returns categories for that workspace.
+    Built-in categories (password, link) are always included.
+    """
+    # Handle case where model passes "None" as a string
+    if workspace_id and workspace_id.lower() == "none":
+        workspace_id = None
+
+    # Built-in categories
+    built_in = ["password (hidden from AI)", "link"]
+
+    if workspace_id:
+        # Workspace categories
+        docs = db.collection("categories").where("workspaceId", "==", workspace_id).stream()
+        ws_docs = db.collection("workspaces").document(workspace_id).get()
+        ws_name = ws_docs.to_dict().get("name", workspace_id) if ws_docs.exists else workspace_id
+        header = f"Categories in '{ws_name}':"
+    else:
+        # Personal categories — filter by createdBy AND workspaceId == null
+        docs = db.collection("categories").where("createdBy", "==", user_id).where("workspaceId", "==", None).stream()
+        header = "Personal categories:"
+
+    categories = []
+    for doc in docs:
+        d = doc.to_dict()
+        name = d.get("name", "")
+        if name.lower() not in BUILT_IN_CATEGORIES:
+            # Count drops using this category (check both array 'categories' and legacy 'category' fields)
+            cat_lower = name.lower()
+            if workspace_id:
+                drops_arr = list(db.collection("drops").where("workspaceId", "==", workspace_id).where("categories", "array_contains", name).limit(201).stream())
+                drops_str = list(db.collection("drops").where("workspaceId", "==", workspace_id).where("category", "==", name).limit(201).stream())
+            else:
+                drops_arr = list(db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).where("categories", "array_contains", name).limit(201).stream())
+                drops_str = list(db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).where("category", "==", name).limit(201).stream())
+            # Deduplicate by doc id
+            all_ids = set()
+            for dd in drops_arr:
+                all_ids.add(dd.id)
+            for dd in drops_str:
+                all_ids.add(dd.id)
+            usage = len(all_ids)
+            categories.append(f"- {name} ({usage} drop{'s' if usage != 1 else ''}, id={doc.id})")
+
+    if not categories and workspace_id:
+        return f"{header}\n  (none — built-in: {', '.join(built_in)})"
+    if not categories:
+        return f"{header}\n  (none — built-in: {', '.join(built_in)})"
+
+    return f"{header}\n{chr(10).join(categories)}\n  Built-in: {', '.join(built_in)}"
+
+
+@mcp.tool()
+def delete_category(user_id: str, category_id: str) -> str:
+    """Delete a category by its ID.
+    The category must belong to you (personal) or be in a workspace you're a member of.
+    Built-in categories (password, link) cannot be deleted.
+    """
+    doc_ref = db.collection("categories").document(category_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        return f"Category '{category_id}' not found."
+
+    d = doc.to_dict()
+    name = d.get("name", "")
+
+    # Block built-in categories
+    if name.lower() in BUILT_IN_CATEGORIES:
+        return f"Cannot delete the built-in '{name}' category."
+
+    ws_id = d.get("workspaceId")
+    created_by = d.get("createdBy")
+
+    # Access control
+    if ws_id:
+        # Workspace category — verify membership
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
+            return "Access denied — you're not a member of this workspace."
+    else:
+        # Personal category — must be creator
+        if created_by != user_id:
+            return "Access denied — you can only delete your own categories."
+
+    doc_ref.delete()
+    return f"Deleted category '{name}'."
+
+
+@mcp.tool()
+def update_drop(
+    user_id: str,
+    drop_id: str,
+    name: str | None = None,
+    content: str | None = None,
+    categories: str | None = None,
+    expiration: str | None = None,
+) -> str:
+    """Update an existing text drop. Can update name, content, categories, and/or expiration.
+    - For personal drops: content updates trigger re-encryption with a new DEK.
+    - For workspace drops: content updates re-encrypt with the workspace key.
+    - Password-category drops cannot be updated.
+    - Supports up to 3 categories per drop (comma-separated).
+    Args:
+        user_id: The user's ID (required).
+        drop_id: ID of the drop to update.
+        name: New name for the drop (optional).
+        content: New text content (optional, triggers re-encryption).
+        categories: Comma-separated list of up to 3 category names (e.g. 'link,anime'). Pass '' to remove all.
+        expiration: New expiration: '1h', '2h', '6h', '24h', 'forever' (optional).
+    """
+    doc_ref = db.collection("drops").document(drop_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        return f"Drop {drop_id} not found."
+
+    d = doc.to_dict()
+
+    # Only text drops can be updated
+    if d.get("type") != "text":
+        return "Only text drops can be updated through the assistant."
+
+    # Access control
+    ws_id = d.get("workspaceId")
+    if ws_id:
+        ws_doc = db.collection("workspaces").document(ws_id).get()
+        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
+            return "Access denied — you're not a member of this workspace."
+    else:
+        if d.get("userId") != user_id:
+            return "Access denied — you can only update your own drops."
+
+    # Block password drops
+    if _is_password_drop(d):
+        return PASSWORD_DENIED
+
+    update_data: dict = {}
+
+    # --- Metadata updates ---
+    if name is not None:
+        if not name.strip():
+            return "Drop name cannot be empty."
+        update_data["name"] = name.strip()
+
+    if categories is not None:
+        # Parse comma-separated categories
+        category_list = [c.strip() for c in categories.split(",") if c.strip()] if categories.strip() else []
+        # Block password in categories
+        for cat in category_list:
+            if cat.lower() == "password":
+                return PASSWORD_DENIED
+        # Trim to max 3
+        if len(category_list) > 3:
+            category_list = category_list[:3]
+        # Resolve category names
+        resolved: list[str] = []
+        if category_list:
+            cat_docs = list(db.collection("categories")
+                           .where("workspaceId", "==", ws_id)
+                           .limit(100).stream())
+            existing_names = {doc.to_dict().get("name", "").lower(): doc.to_dict().get("name") for doc in cat_docs}
+            for cat in category_list:
+                cat_stripped = cat.strip()
+                cat_lower = cat_stripped.lower()
+                if not cat_lower:
+                    continue
+                if cat_lower in BUILT_IN_CATEGORIES:
+                    resolved.append(cat_lower)
+                elif cat_lower in existing_names:
+                    resolved.append(existing_names[cat_lower])
+                else:
+                    # Auto-create
+                    db.collection("categories").add({
+                        "name": cat_lower,
+                        "workspaceId": ws_id,
+                        "createdBy": user_id,
+                        "createdAt": firestore.SERVER_TIMESTAMP,
+                    })
+                    resolved.append(cat_lower)
+        update_data["categories"] = resolved
+        update_data["category"] = None  # Clear legacy field
+
+    if expiration is not None:
+        valid_expirations = ("1h", "2h", "6h", "24h", "forever")
+        if expiration not in valid_expirations:
+            return f"Invalid expiration. Must be one of: {', '.join(valid_expirations)}"
+        update_data["expirationOption"] = expiration
+        if expiration == "forever":
+            update_data["expiresAt"] = None
+        else:
+            hours = int(expiration.replace("h", ""))
+            update_data["expiresAt"] = datetime.now(timezone.utc) + timedelta(hours=hours)
+
+    # --- Content update (requires re-encryption) ---
+    if content is not None:
+        if ws_id:
+            # Workspace drop — re-encrypt with workspace key
+            encrypted = encrypt_workspace_drop(user_id, ws_id, content)
+            if not encrypted:
+                return "Failed to encrypt content. Workspace encryption key may not be set up."
+            update_data.update(encrypted)
+        else:
+            # Personal drop — generate new DEK, re-encrypt
+            encrypted = encrypt_personal_drop(user_id, content)
+            if not encrypted:
+                return "Failed to encrypt content. User encryption keys may not be set up."
+            update_data.update(encrypted)
+
+    # Nothing to update
+    if not update_data:
+        return "Nothing to update — no changes were specified."
+
+    # Write to Firestore
+    doc_ref.update(update_data)
+
+    # Build confirmation message
+    changes = []
+    if "name" in update_data:
+        changes.append(f"name -> '{update_data['name']}'")
+    if "categories" in update_data:
+        cats = ", ".join(update_data["categories"]) if update_data["categories"] else "none"
+        changes.append(f"categories -> {cats}")
+    if "expirationOption" in update_data:
+        changes.append(f"expiration -> {update_data['expirationOption']}")
+    if content is not None:
+        changes.append("content re-encrypted")
+
+    return f"Updated drop {drop_id}: {', '.join(changes)}."
 
 
 # ── Run ─────────────────────────────────────────────────────────

@@ -10,9 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agents import Runner, InputGuardrailTripwireTriggered
 from agents.mcp import MCPServerStdio
+from agents.items import ToolCallItem
+from openai.types.responses.response_output_item import McpCall
 from firebase_admin import auth as firebase_auth
 
-from config import run_config
+from config import run_config, MODEL_NAME, db
 from agent import dropsync_agent
 
 app = FastAPI(title="DropSync Agent API")
@@ -58,6 +60,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    previewDropId: str | None = None
+    previewWorkspaceId: str | None = None
 
 
 # ── Endpoints ───────────────────────────────────────────────────
@@ -98,7 +102,39 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
             conversation,
             run_config=run_config,
         )
-        return ChatResponse(response=result.final_output)
+        response = result.final_output
+
+        # Debug: log what's in result.new_items
+        # Inspect tool call history for preview_drop calls
+        preview_drop_id = None
+        for item in result.new_items:
+            if hasattr(item, 'raw_item') and item.raw_item:
+                call = item.raw_item
+                # Check name attribute on any tool call (MCP tools show as ResponseFunctionToolCall)
+                call_name = getattr(call, 'name', None)
+                if call_name == "preview_drop":
+                    args_raw = getattr(call, 'arguments', '{}')
+                    import json
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except Exception:
+                        args = {}
+                    preview_drop_id = args.get("drop_id")
+                    break
+
+        # Get workspace_id from Firestore if we have a drop_id
+        preview_ws_id = None
+        if preview_drop_id:
+            doc = db.collection("drops").document(preview_drop_id).get()
+            if doc.exists:
+                ws_id = doc.to_dict().get("workspaceId")
+                preview_ws_id = ws_id if ws_id else None
+
+        return ChatResponse(
+            response=response,
+            previewDropId=preview_drop_id,
+            previewWorkspaceId=preview_ws_id,
+        )
 
     except InputGuardrailTripwireTriggered as e:
         return ChatResponse(
@@ -116,7 +152,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "kimi-k2.5"}
+    return {"status": "ok", "model": MODEL_NAME}
 
 
 if __name__ == "__main__":

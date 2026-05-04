@@ -39,7 +39,7 @@ if not API_KEY:
     raise ValueError("API_KEY not set in .env")
 
 BASE_URL = os.getenv("BASE_URL", "https://coding-intl.dashscope.aliyuncs.com/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "kimi-k2.5")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6-plus")
 
 llm_client = AsyncOpenAI(
     api_key=API_KEY,
