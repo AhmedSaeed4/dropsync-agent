@@ -117,6 +117,7 @@ You have access to these tools:
 - list_categories: List categories (personal or workspace)
 - delete_category: Delete a category by its ID
 - preview_drop: Get the info needed to open a drop in the UI. Call this when the user asks to open, preview, or show a specific drop.
+- move_drop: Move a drop from one workspace to another. Workspace-to-workspace only. Use this when the user asks to move a drop. Handles text drops with attached images — both content and images are moved. Categories are preserved.
 - get_storage_stats: Show storage usage and limits
 
 Workspace Context:
@@ -166,6 +167,7 @@ Need me to open one?
 - You can update existing text drops using update_drop — change name, content, categories (comma-separated string, up to 3), or expiration. Content is automatically re-encrypted. For personal drops a new DEK is generated; for workspace drops the workspace key is used. IMPORTANT: the categories parameter REPLACES all existing categories — it does NOT append. When a user says "add a category", you must first read the drop's current categories, then pass ALL of them plus the new ones (max 3 total) to the tool.
 - You can list and delete categories using list_categories and delete_category. list_categories shows how many drops use each category — use this info to tell the user which categories are empty (0 drops). Built-in categories (password, link) cannot be deleted. Never make up usage counts — always read them from the tool output.
 - When the user asks to open, preview, or show a specific drop, call the preview_drop tool with the drop_id. This will open the drop in the UI. Always use this tool for preview requests — do NOT just list the drop details as text.
+- When the user asks to move a drop between workspaces, call the move_drop tool. This only works for workspace-to-workspace moves. If the drop is personal or the target is personal, tell them to use the DropSync app. Categories are preserved and matched to the target workspace — missing categories are auto-created.
 """,
     mcp_servers=[],  # Attached per-request in main.py
     input_guardrails=[password_guardrail],

@@ -18,7 +18,8 @@ if _this_dir not in sys.path:
 from mcp.server.fastmcp import FastMCP
 
 from config import db
-from decrypt import decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop
+from decrypt import decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop, _get_workspace_key_data, _decrypt_with_workspace_key, _encrypt_with_workspace_key
+from r2 import fetch_from_r2, fetch_from_r2_by_key, upload_to_r2, delete_from_r2
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -369,6 +370,187 @@ def preview_drop(user_id: str, drop_id: str) -> str:
 
     ws_name = _get_workspace_name(ws_id) if ws_id else "Personal"
     return f"I'll open '{d.get('name', drop_id)}' for you."
+
+
+@mcp.tool()
+def move_drop(user_id: str, drop_id: str, target_workspace_id: str) -> str:
+    """Move a drop from one workspace to another.
+    Both the source and target must be workspaces (not personal drops).
+    The user must be a member of both workspaces.
+    Handles text drops with attached images — both content and images are re-encrypted.
+    Categories are preserved and matched to the target workspace — missing categories are auto-created.
+    Args:
+        user_id: The user's ID (required).
+        drop_id: ID of the drop to move.
+        target_workspace_id: ID of the target workspace.
+    """
+    doc_ref = db.collection("drops").document(drop_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        return f"Drop {drop_id} not found."
+
+    d = doc.to_dict()
+    source_ws = d.get("workspaceId")
+
+    # Block personal drops
+    if not source_ws:
+        return "Cannot move personal drops via chat. Use the DropSync app to move personal drops."
+
+    # Block moving to personal
+    if not target_workspace_id or target_workspace_id.lower() == "none":
+        return "Cannot move workspace drops to personal via chat. Use the DropSync app."
+
+    # Can't move to the same workspace
+    if source_ws == target_workspace_id:
+        return f"Drop is already in that workspace."
+
+    # Verify membership in source workspace
+    src_ws_doc = db.collection("workspaces").document(source_ws).get()
+    if not src_ws_doc.exists or user_id not in (src_ws_doc.to_dict().get("members") or []):
+        return "Access denied — you're not a member of the source workspace."
+
+    # Verify membership in target workspace
+    tgt_ws_doc = db.collection("workspaces").document(target_workspace_id).get()
+    if not tgt_ws_doc.exists or user_id not in (tgt_ws_doc.to_dict().get("members") or []):
+        return "Access denied — you're not a member of the target workspace."
+
+    # Block password drops
+    if _is_password_drop(d):
+        return PASSWORD_DENIED
+
+    # Only text drops can be moved via agent
+    if d.get("type") != "text":
+        return "Only text drops can be moved via chat. Use the app to move file drops."
+
+    # Decrypt content with source workspace key
+    src_name = _get_workspace_name(source_ws)
+    tgt_name = _get_workspace_name(target_workspace_id)
+
+    decrypted_content = decrypt_drop_content(user_id, d)
+    if not decrypted_content:
+        return "Failed to decrypt drop content. Cannot move."
+
+    # Re-encrypt with target workspace key
+    encrypted = encrypt_workspace_drop(user_id, target_workspace_id, decrypted_content)
+    if not encrypted:
+        return "Failed to re-encrypt content for target workspace."
+
+    # Update Firestore
+    update_data = {
+        "workspaceId": target_workspace_id,
+        "content": encrypted["content"],
+        "iv": encrypted["iv"],
+        "encrypted": True,
+        "encryptedDEK": None,  # Remove personal DEK if present
+        "category": None,
+    }
+
+    # Category matching: preserve and auto-create categories in target workspace
+    source_categories = d.get("categories") or ([d.get("category")] if d.get("category") else [])
+    if source_categories:
+        resolved_categories = []
+        custom_categories = []
+
+        # Separate built-in from custom categories
+        for cat_name in source_categories:
+            if cat_name.lower().strip() in BUILT_IN_CATEGORIES:
+                resolved_categories.append(cat_name.lower().strip())
+            else:
+                custom_categories.append(cat_name)
+
+        # Query existing categories in target workspace
+        if custom_categories:
+            cat_docs = list(db.collection("categories")
+                            .where("workspaceId", "==", target_workspace_id)
+                            .limit(100).stream())
+            existing_categories = {}
+            for cat_doc in cat_docs:
+                data = cat_doc.to_dict()
+                existing_categories[data["name"].lower().strip()] = data["name"]
+
+            for cat_name in custom_categories:
+                name_lower = cat_name.lower().strip()
+                if name_lower in existing_categories:
+                    resolved_categories.append(existing_categories[name_lower])
+                else:
+                    db.collection("categories").add({
+                        "name": name_lower,
+                        "workspaceId": target_workspace_id,
+                        "createdBy": user_id,
+                        "createdAt": firestore.SERVER_TIMESTAMP,
+                    })
+                    existing_categories[name_lower] = name_lower
+                    resolved_categories.append(name_lower)
+
+        update_data["categories"] = resolved_categories
+    else:
+        update_data["categories"] = []
+
+    # Handle attached image re-encryption
+    old_image_r2_key = d.get("imageR2Key")
+    if d.get("imageUrl") and d.get("imageIv"):
+        encrypted_image = fetch_from_r2_by_key(d.get("imageR2Key"))
+        if encrypted_image:
+            source_key = _get_workspace_key_data(source_ws)
+            if source_key:
+                decrypted_image = _decrypt_with_workspace_key(encrypted_image, d["imageIv"], source_key)
+                if decrypted_image:
+                    target_key = _get_workspace_key_data(target_workspace_id)
+                    if target_key:
+                        re_encrypted = _encrypt_with_workspace_key(decrypted_image, target_key)
+                        if re_encrypted:
+                            upload_result = upload_to_r2(re_encrypted["content"])
+                            update_data["imageUrl"] = upload_result["url"]
+                            update_data["imageR2Key"] = upload_result["key"]
+                            update_data["imageIv"] = re_encrypted["iv"]
+                            if d.get("imageSize"):
+                                update_data["imageSize"] = d["imageSize"]
+                            if d.get("imageMimeType"):
+                                update_data["imageMimeType"] = d["imageMimeType"]
+                        else:
+                            # Re-encryption failed — clear image
+                            update_data["imageUrl"] = None
+                            update_data["imageR2Key"] = None
+                            update_data["imageIv"] = None
+                            update_data["imageSize"] = None
+                            update_data["imageMimeType"] = None
+                    else:
+                        update_data["imageUrl"] = None
+                        update_data["imageR2Key"] = None
+                        update_data["imageIv"] = None
+                        update_data["imageSize"] = None
+                        update_data["imageMimeType"] = None
+                else:
+                    update_data["imageUrl"] = None
+                    update_data["imageR2Key"] = None
+                    update_data["imageIv"] = None
+                    update_data["imageSize"] = None
+                    update_data["imageMimeType"] = None
+            else:
+                update_data["imageUrl"] = None
+                update_data["imageR2Key"] = None
+                update_data["imageIv"] = None
+                update_data["imageSize"] = None
+                update_data["imageMimeType"] = None
+        else:
+            # Fetch failed — clear image to avoid broken state
+            update_data["imageUrl"] = None
+            update_data["imageR2Key"] = None
+            update_data["imageIv"] = None
+            update_data["imageSize"] = None
+            update_data["imageMimeType"] = None
+
+    doc_ref.update(update_data)
+
+    # Clean up old R2 image after successful update
+    if old_image_r2_key and old_image_r2_key != update_data.get("imageR2Key"):
+        try:
+            delete_from_r2(old_image_r2_key)
+        except Exception:
+            pass
+
+    return f"Moved drop '{d.get('name', drop_id)}' from '{src_name}' to '{tgt_name}'. Categories were preserved."
 
 
 @mcp.tool()

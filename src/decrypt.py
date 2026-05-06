@@ -224,6 +224,60 @@ def encrypt_workspace_drop(user_id: str, workspace_id: str, content: str) -> dic
         return None
 
 
+def _get_workspace_key_data(workspace_id: str) -> bytes | None:
+    """Get raw workspace AES key bytes. Returns the key or None."""
+    try:
+        wk = db.collection("workspaceKeys").document(workspace_id).get()
+        if not wk.exists:
+            return None
+        wk_data = wk.to_dict()
+
+        # Derive AES key from secret (first 32 bytes)
+        secret_bytes = wk_data["keySecret"].encode("utf-8")[:32].ljust(32, b"\x00")
+
+        # Decrypt workspace key
+        wk_bytes_b64 = AESGCM(secret_bytes).decrypt(
+            b64d(wk_data["iv"]),
+            b64d(wk_data["encryptedKey"]),
+            None,
+        )
+        return b64d(wk_bytes_b64.decode())
+    except Exception as e:
+        print(f"Error getting workspace key: {e}")
+        return None
+
+
+def _decrypt_with_workspace_key(encrypted_b64: str, iv_b64: str, key_bytes: bytes) -> str | None:
+    """Decrypt base64-encoded AES-GCM data using workspace key. Returns plaintext string."""
+    try:
+        return AESGCM(key_bytes).decrypt(
+            b64d(iv_b64),
+            b64d(encrypted_b64),
+            None,
+        ).decode("utf-8")
+    except Exception as e:
+        print(f"Error decrypting with workspace key: {e}")
+        return None
+
+
+def _encrypt_with_workspace_key(plaintext: str, key_bytes: bytes) -> dict | None:
+    """Encrypt plaintext string using workspace key. Returns {content, iv} (base64 strings)."""
+    try:
+        content_iv = os.urandom(12)
+        encrypted = AESGCM(key_bytes).encrypt(
+            content_iv,
+            plaintext.encode("utf-8"),
+            None,
+        )
+        return {
+            "content": b64e(encrypted),
+            "iv": b64e(content_iv),
+        }
+    except Exception as e:
+        print(f"Error encrypting with workspace key: {e}")
+        return None
+
+
 # ── Main entry points ────────────────────────────────────────────
 
 def decrypt_drop_content(user_id: str, drop_data: dict) -> str | None:
