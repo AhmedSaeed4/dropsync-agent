@@ -4,13 +4,11 @@ from openai import AsyncOpenAI
 from agents import OpenAIChatCompletionsModel, RunConfig
 import os
 
-from config import llm_client
+from config import llm_client, MODEL_NAME
 
 # ── Password Guardrail ──────────────────────────────────────────
 # Uses the OpenAI Agents SDK pattern: guardrail Agent + Runner.run()
 # This runs BEFORE the main agent to catch password-access attempts.
-
-GUARDRAIL_MODEL = "qwen3.6-plus"
 
 
 class GuardrailCheck(BaseModel):
@@ -20,7 +18,7 @@ class GuardrailCheck(BaseModel):
 
 
 _guardrail_model = OpenAIChatCompletionsModel(
-    model=GUARDRAIL_MODEL,
+    model=MODEL_NAME,
     openai_client=llm_client,
 )
 
