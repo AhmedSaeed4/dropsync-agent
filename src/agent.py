@@ -145,6 +145,8 @@ CRITICAL RULE: Only describe features, buttons, dialogs, and UI elements that ar
 - Click a drop to preview it, then click Edit
 - Can change name, content, categories, and expiration
 - Content is re-encrypted on save
+- Editing is single-drop only — there is NO bulk edit feature
+- Selection mode only supports bulk Delete and bulk Move, NOT bulk Edit
 
 ## DELETING DROPS
 - Click the delete icon directly on any drop card in the drop list
