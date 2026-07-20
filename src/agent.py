@@ -286,7 +286,7 @@ Need me to open one?
     handoffs=[],  # Wired below
 )
 
-# Wire bidirectional handoffs with patched schemas for DashScope compatibility
+# Wire bidirectional handoffs with patched schemas — non-OpenAI providers (Groq) reject the SDK's strict handoff schema
 _knowledge_handoff = handoff(knowledge_agent)
 _knowledge_handoff.input_json_schema = {"type": "object", "properties": {}}
 _knowledge_handoff.strict_json_schema = False
