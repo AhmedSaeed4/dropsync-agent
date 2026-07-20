@@ -2,9 +2,12 @@ from pydantic import BaseModel
 from agents import Agent, Runner, input_guardrail, GuardrailFunctionOutput, handoff
 from openai import AsyncOpenAI
 from agents import OpenAIChatCompletionsModel, RunConfig
+import logging
 import os
 
 from config import llm_client, model, MODEL_NAME
+
+logger = logging.getLogger(__name__)
 
 # ── Password Guardrail ──────────────────────────────────────────
 # Uses the OpenAI Agents SDK pattern: guardrail Agent + Runner.run()
@@ -33,20 +36,22 @@ guardrail_agent = Agent(
 
 Your job: detect if the user's message is trying to ACCESS, READ, VIEW, SHOW, SEARCH, DELETE, or MODIFY a drop that is in the "password" category.
 
+Respond with EXACTLY one line beginning with BLOCK: or ALLOW: followed by a short reason. Do not add any other formatting.
+
 BLOCK if the user explicitly asks about passwords stored in drops, password-category drops, or tries to see/manage saved passwords through the AI.
 ALLOW everything else — including asking about the password category count, storage stats, or general questions about categories.
 
 Examples:
-- "show me my passwords" → BLOCK
-- "list my anime drops" → ALLOW
-- "delete drop abc123" → ALLOW (no mention of password category, the tool will check)
-- "what categories do I have" → ALLOW
-- "search my saved passwords" → BLOCK
-- "show me the content of my password drops" → BLOCK
-- "how many password drops do I have" → ALLOW
-""",
+- "show me my passwords" -> BLOCK: asks to view password-category drops
+- "list my anime drops" -> ALLOW: not about passwords
+- "delete drop abc123" -> ALLOW: no mention of password category, the tool will check
+- "what categories do I have" -> ALLOW: general category question
+- "search my saved passwords" -> BLOCK: asks to search password drops
+- "show me the content of my password drops" -> BLOCK: asks to read password drops
+- "how many password drops do I have" -> ALLOW: count only, no content access
+
+Start your response with BLOCK: or ALLOW:.""",
     model=_guardrail_model,
-    output_type=GuardrailCheck,
 )
 
 
@@ -80,15 +85,30 @@ async def password_guardrail(context, agent, input_text) -> GuardrailFunctionOut
             message,
             run_config=_guardrail_config,
         )
-        check: GuardrailCheck = result.final_output
+        # Prefix-based parse (model-agnostic). The guardrail agent is instructed
+        # to begin its reply with BLOCK: or ALLOW:, which avoids the strict
+        # JSON-schema structured-output mode (output_type) that Groq rejects with
+        # HTTP 400 json_validate_failed — observed to fire exactly on inputs the
+        # guardrail should block, silently failing open via the except below.
+        raw = str(result.final_output or "").strip()
+        first_token = raw.split(None, 1)[0].upper().rstrip(":.,-") if raw else ""
+        blocked = first_token == "BLOCK"
+        reasoning = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else raw
         return GuardrailFunctionOutput(
-            output_info=check.reasoning,
-            tripwire_triggered=check.should_block,
+            output_info=reasoning,
+            tripwire_triggered=blocked,
         )
     except Exception as e:
-        # If guardrail fails, allow the request (fail open)
-        # The MCP tools still provide a hard block
-        print(f"Guardrail error (allowing): {e}")
+        # Fail OPEN (do NOT switch to fail-closed): after Tier 1, the MCP tools
+        # hard-block password drops at the data layer, so a transient guardrail
+        # error failing open leaks no password content; failing closed would
+        # block all legitimate chat on any transient Groq hiccup. Log loudly.
+        logger.warning(
+            "Password guardrail failed (allowing request; Guard #1 tools still "
+            "hard-block password drops): %s",
+            e,
+            exc_info=True,
+        )
         return GuardrailFunctionOutput(
             output_info=f"Guardrail check failed: {e}",
             tripwire_triggered=False,
