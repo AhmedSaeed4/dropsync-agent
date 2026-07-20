@@ -43,9 +43,24 @@ BUILT_IN_CATEGORIES = {"password", "link"}
 # ── Helpers ─────────────────────────────────────────────────────
 
 def _is_password_drop(d: dict) -> bool:
-    """Check if a drop is in the password category."""
-    cat = d.get("category") or ""
-    return cat.lower() == "password"
+    """True if the drop is in the password category.
+
+    Checks both the canonical `categories` array AND the legacy singular
+    `category` field (case-insensitive, whitespace-trimmed) — the frontend
+    writes password drops as {category: null, categories: ["password"]}, so
+    checking only `category` misses them. Defensive against None / non-dict /
+    missing / non-str / non-list values so it can never throw.
+    """
+    if not isinstance(d, dict):
+        return False
+    cats = d.get("categories")
+    if isinstance(cats, list):
+        if any(isinstance(c, str) and c.strip().lower() == "password" for c in cats):
+            return True
+    cat = d.get("category")
+    if isinstance(cat, str) and cat.strip().lower() == "password":
+        return True
+    return False
 
 
 def _score_query(query: str, name: str, category: str, content: str) -> float:
