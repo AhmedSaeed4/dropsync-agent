@@ -8,14 +8,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agents import Runner, InputGuardrailTripwireTriggered
+from agents import Runner, InputGuardrailTripwireTriggered, handoff
 from agents.mcp import MCPServerStdio
 from agents.items import ToolCallItem
 from openai.types.responses.response_output_item import McpCall
 from firebase_admin import auth as firebase_auth
 
 from config import run_config, MODEL_NAME, db
-from agent import dropsync_agent
+from agent import dropsync_agent, knowledge_agent
 
 app = FastAPI(title="DropSync Agent API")
 
@@ -44,6 +44,27 @@ async def verify_user(authorization: str = Header(...)) -> str:
         return decoded["uid"]
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+def _build_sub_env(uid: str) -> dict:
+    """Build the per-request MCP subprocess env with the Firebase-verified uid.
+
+    SECURITY INVARIANTS — read before editing this function:
+    1. MUST return a NEW dict via {**os.environ, ...}. NEVER write to
+       os.environ (e.g. `os.environ[...] = uid`) — os.environ is shared across
+       all concurrent requests in one uvicorn worker, so mutating it leaks
+       user A's uid into user B's request. The dict-spread is load-bearing.
+    2. DROPSYNC_VERIFIED_UID is the SOLE trust source for caller identity in
+       tools_server.py. The model cannot read or override os.environ (no tool
+       exposes it) and user_id is no longer a tool parameter.
+    3. The MCP subprocess MUST be spawned fresh per /chat (MCPServerStdio +
+       connect/cleanup below). NEVER pool/reuse subprocesses across requests —
+       a stale env var serves the first user's uid to later users (silent
+       impersonation that _verified_uid()'s fail-closed check does NOT catch,
+       because the var is present-but-wrong, not missing).
+    """
+    assert isinstance(uid, str) and uid, "uid must be a non-empty string"
+    return {**os.environ, "DROPSYNC_VERIFIED_UID": uid}
 
 
 # ── Models ──────────────────────────────────────────────────────
@@ -76,13 +97,15 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
     for msg in req.history:
         conversation.append({"role": msg.role, "content": msg.content})
 
-    # Add new message with user_id context
-    conversation.append({"role": "user", "content": f"[user_id: {user_id}]\n{req.message}"})
+    # Add new message (caller identity is NOT pasted into the prompt — it travels
+    # out-of-band via DROPSYNC_VERIFIED_UID in the per-request subprocess env).
+    conversation.append({"role": "user", "content": req.message})
 
     tools_server_path = str(Path(__file__).parent / "tools_server.py")
 
-    # Explicitly pass env vars to subprocess (HF Spaces Docker needs this)
-    _sub_env = {**os.environ}
+    # Build per-request subprocess env carrying the Firebase-verified uid on a
+    # channel the model cannot read or override (see _build_sub_env invariants).
+    _sub_env = _build_sub_env(user_id)
 
     server = MCPServerStdio(
         params={
@@ -93,12 +116,35 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
         client_session_timeout_seconds=60,
     )
 
-    dropsync_agent.mcp_servers = [server]
+    # SECURITY (CRITICAL — race fix): clone the agents PER REQUEST. Never
+    # mutate the shared module-level dropsync_agent.mcp_servers — concurrent
+    # /chat requests race on that attribute (await server.connect() below
+    # yields to the event loop, letting a second request overwrite
+    # dropsync_agent.mcp_servers before Runner.run reads it, which would run
+    # request A's agent against request B's server/subprocess and serve B's
+    # DROPSYNC_VERIFIED_UID to A — full cross-user data leak). Each request
+    # gets its own private agent+server pair via clone(); the shared
+    # dropsync_agent / knowledge_agent are never touched.
+    request_dropsync = dropsync_agent.clone(mcp_servers=[server])
+    request_knowledge = knowledge_agent.clone()
+
+    # Rewire handoffs between the per-request clones so the dropsync <->
+    # knowledge handoff chain stays intact and never targets a shared
+    # module-level agent. Groq needs the relaxed schema (non-OpenAI providers
+    # reject the SDK's strict handoff schema — see agent.py:309-316).
+    _req_kh = handoff(request_knowledge)
+    _req_kh.input_json_schema = {"type": "object", "properties": {}}
+    _req_kh.strict_json_schema = False
+    _req_dh = handoff(request_dropsync)
+    _req_dh.input_json_schema = {"type": "object", "properties": {}}
+    _req_dh.strict_json_schema = False
+    request_dropsync.handoffs = [_req_kh]
+    request_knowledge.handoffs = [_req_dh]
 
     try:
         await server.connect()
         result = await Runner.run(
-            dropsync_agent,
+            request_dropsync,
             conversation,
             run_config=run_config,
         )
@@ -147,7 +193,6 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
 
     finally:
         await server.cleanup()
-        dropsync_agent.mcp_servers = []
 
 
 @app.get("/health")
