@@ -103,6 +103,37 @@ def _is_workspace_member(user_id: str | None, workspace_id: str | None) -> bool:
     return isinstance(members, list) and user_id in members
 
 
+_UID_DENIED = "Access denied — no verified user identity for this request."
+
+
+def _verified_uid() -> str | None:
+    """Return the LLM-unforgeable caller uid, or None to deny.
+
+    SECURITY: this is the ONLY trusted source of caller identity. It reads
+    DROPSYNC_VERIFIED_UID from os.environ, which main.py injects into the
+    per-request MCP subprocess from the Firebase-verified token. The model
+    cannot read or override os.environ (no tool exposes it), and user_id is no
+    longer a tool parameter, so there is NO channel for the model to influence
+    this value.
+
+    Callers MUST deny (return _UID_DENIED) when this returns None. Never fall
+    back to a model-supplied uid — the parameter does not exist.
+
+    The subprocess MUST be fresh per request (main.py spawns via
+    MCPServerStdio + connect/cleanup per /chat). A stale/corrupt value fails
+    closed here rather than querying Firestore with garbage.
+    """
+    raw = os.environ.get("DROPSYNC_VERIFIED_UID")
+    if not isinstance(raw, str):
+        return None
+    uid = raw.strip()
+    # Firebase uids are non-empty, no whitespace, reasonable length.
+    # A stale/corrupt/truncated value fails closed here.
+    if not uid or len(uid) > 128 or any(c.isspace() for c in uid):
+        return None
+    return uid
+
+
 def _score_query(query: str, name: str, category: str, content: str) -> float:
     """Score a drop against a multi-token query. Returns 0.0 for no match.
     Higher score = better match. Name matches weigh most, then category, then content."""
@@ -225,11 +256,14 @@ def _get_all_accessible_drops(user_id: str) -> list:
 # ── Tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_drops(user_id: str, workspace_id: str | None = None) -> str:
+def list_drops(workspace_id: str | None = None) -> str:
     """List drops for a user, optionally filtered by workspace.
     - No workspace_id (None): returns personal drops only (workspaceId == null).
     - With workspace_id: returns ALL drops in that workspace from ALL members.
     Password-category drops are excluded."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
 
     # Handle case where model passes "None" as a string
     if workspace_id and workspace_id.lower() != "none":
@@ -266,11 +300,14 @@ def list_drops(user_id: str, workspace_id: str | None = None) -> str:
 
 
 @mcp.tool()
-def search_drops(user_id: str, query: str) -> str:
+def search_drops(query: str) -> str:
     """Search drops by name, text content, or category. Searches through decrypted content too.
     Uses scoring and ranking — handles typos like 'bilal disord' matching 'AWS bilal'.
     Searches across personal drops AND all workspace drops the user has access to.
     Password-category drops are excluded from results."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
 
     scored_results: list[tuple[float, str]] = []  # (score, formatted_string)
     query_lower = query.lower().strip()
@@ -317,10 +354,14 @@ def search_drops(user_id: str, query: str) -> str:
 
 
 @mcp.tool()
-def get_drop(user_id: str, drop_id: str) -> str:
+def get_drop(drop_id: str) -> str:
     """Get full details for a specific drop, including decrypted content.
     For personal drops: only the owner can access. For workspace drops: any member can access.
     Password-category drops cannot be accessed."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc = db.collection("drops").document(drop_id).get()
 
     if not doc.exists:
@@ -376,10 +417,14 @@ def get_drop(user_id: str, drop_id: str) -> str:
 
 
 @mcp.tool()
-def delete_drop(user_id: str, drop_id: str) -> str:
+def delete_drop(drop_id: str) -> str:
     """Delete a drop.
     For personal drops: only the owner can delete. For workspace drops: any member can delete.
     Password-category drops cannot be deleted through the agent."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc_ref = db.collection("drops").document(drop_id)
     doc = doc_ref.get()
 
@@ -405,10 +450,14 @@ def delete_drop(user_id: str, drop_id: str) -> str:
 
 
 @mcp.tool()
-def preview_drop(user_id: str, drop_id: str) -> str:
+def preview_drop(drop_id: str) -> str:
     """Get the drop ID and workspace ID needed to open a drop in the UI preview.
     Use this when the user asks to open, preview, or show a specific drop.
     Returns the drop details needed for the UI to open it."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc = db.collection("drops").document(drop_id).get()
     if not doc.exists:
         return f"Drop {drop_id} not found."
@@ -429,17 +478,20 @@ def preview_drop(user_id: str, drop_id: str) -> str:
 
 
 @mcp.tool()
-def move_drop(user_id: str, drop_id: str, target_workspace_id: str) -> str:
+def move_drop(drop_id: str, target_workspace_id: str) -> str:
     """Move a drop from one workspace to another.
     Both the source and target must be workspaces (not personal drops).
     The user must be a member of both workspaces.
     Handles text drops with attached images — both content and images are re-encrypted.
     Categories are preserved and matched to the target workspace — missing categories are auto-created.
     Args:
-        user_id: The user's ID (required).
         drop_id: ID of the drop to move.
         target_workspace_id: ID of the target workspace.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc_ref = db.collection("drops").document(drop_id)
     doc = doc_ref.get()
 
@@ -608,9 +660,12 @@ def move_drop(user_id: str, drop_id: str, target_workspace_id: str) -> str:
 
 
 @mcp.tool()
-def list_workspaces(user_id: str) -> str:
+def list_workspaces() -> str:
     """List all workspaces the user has access to, including their personal space.
     Returns personal space first, then all shared workspaces."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
 
     workspaces = ["- Personal Space (your private drops, workspace_id=None)"]
 
@@ -631,9 +686,12 @@ def list_workspaces(user_id: str) -> str:
 
 
 @mcp.tool()
-def get_storage_stats(user_id: str) -> str:
+def get_storage_stats() -> str:
     """Get storage stats across personal drops and all workspace drops the user has access to.
     Password drops are counted but content is not shown. Includes per-workspace breakdown."""
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
 
     total_drops = 0
     total_size = 0
@@ -688,7 +746,6 @@ def get_storage_stats(user_id: str) -> str:
 
 @mcp.tool()
 def create_drop(
-    user_id: str,
     name: str,
     content: str,
     workspace_id: str | None = None,
@@ -698,7 +755,6 @@ def create_drop(
     """Create a new text drop. The content will be encrypted automatically.
     Cannot create drops in the 'password' category.
     Args:
-        user_id: The user's ID (required).
         name: Title for the drop.
         content: Text content for the drop.
         workspace_id: Optional workspace ID. If provided, creates in that workspace.
@@ -706,6 +762,10 @@ def create_drop(
         expiration: When the drop expires. Options: '1h', '2h', '6h', '24h', 'forever'. Default: '2h'.
     Returns confirmation with the drop ID or an error message.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     # Handle case where model passes "None" as a string
     if workspace_id and workspace_id.lower() == "none":
         workspace_id = None
@@ -846,14 +906,17 @@ def _generate_invite_code() -> str:
 
 
 @mcp.tool()
-def create_workspace(user_id: str, name: str) -> str:
+def create_workspace(name: str) -> str:
     """Create a new workspace. The creator becomes the owner.
     A workspace encryption key and invite code are generated automatically.
     Args:
-        user_id: The user's ID (required).
         name: Name for the workspace.
     Returns confirmation with workspace ID and invite code, or an error message.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     if not name.strip():
         return "Workspace name cannot be empty."
 
@@ -883,10 +946,14 @@ def create_workspace(user_id: str, name: str) -> str:
 
 
 @mcp.tool()
-def join_workspace(user_id: str, invite_code: str) -> str:
+def join_workspace(invite_code: str) -> str:
     """Join a workspace using an invite code.
     Returns the workspace details or an error if the code is invalid or you're already a member.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     invite_code = invite_code.strip().upper()
     if not invite_code:
         return "Invite code cannot be empty."
@@ -917,13 +984,17 @@ def join_workspace(user_id: str, invite_code: str) -> str:
 
 
 @mcp.tool()
-def list_categories(user_id: str, workspace_id: str | None = None) -> str:
+def list_categories(workspace_id: str | None = None) -> str:
     """List categories for a user, optionally filtered by workspace.
     Shows how many drops use each category so you can tell which are empty.
     - No workspace_id: returns personal categories only.
     - With workspace_id: returns categories for that workspace.
     Built-in categories (password, link) are always included.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     # Handle case where model passes "None" as a string
     if workspace_id and workspace_id.lower() == "none":
         workspace_id = None
@@ -976,11 +1047,15 @@ def list_categories(user_id: str, workspace_id: str | None = None) -> str:
 
 
 @mcp.tool()
-def delete_category(user_id: str, category_id: str) -> str:
+def delete_category(category_id: str) -> str:
     """Delete a category by its ID.
     The category must belong to you (personal) or be in a workspace you're a member of.
     Built-in categories (password, link) cannot be deleted.
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc_ref = db.collection("categories").document(category_id)
     doc = doc_ref.get()
 
@@ -1013,7 +1088,6 @@ def delete_category(user_id: str, category_id: str) -> str:
 
 @mcp.tool()
 def update_drop(
-    user_id: str,
     drop_id: str,
     name: str | None = None,
     content: str | None = None,
@@ -1026,13 +1100,16 @@ def update_drop(
     - Password-category drops cannot be updated.
     - Supports up to 3 categories per drop (comma-separated).
     Args:
-        user_id: The user's ID (required).
         drop_id: ID of the drop to update.
         name: New name for the drop (optional).
         content: New text content (optional, triggers re-encryption).
         categories: Comma-separated list of up to 3 category names (e.g. 'link,anime'). Pass '' to remove all.
         expiration: New expiration: '1h', '2h', '6h', '24h', 'forever' (optional).
     """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
     doc_ref = db.collection("drops").document(drop_id)
     doc = doc_ref.get()
 
