@@ -63,6 +63,46 @@ def _is_password_drop(d: dict) -> bool:
     return False
 
 
+ACCESS_DENIED_WORKSPACE = "Access denied — you're not a member of this workspace."
+
+
+def _is_workspace_member(user_id: str | None, workspace_id: str | None) -> bool:
+    """True if user_id may read/write workspace-scoped data for workspace_id.
+
+    Mirrors the firestore.rules workspace-read contract (members array OR ownerId)
+    and the in-tool membership check already used by get_drop / delete_drop /
+    preview_drop / move_drop / delete_category / update_drop. Returns True for
+    personal context (workspace_id None / '' / 'none') so callers can gate the
+    workspace branch without special-casing personal drops. A non-string truthy
+    workspace_id (schema drift / corrupted doc) is treated as malformed and
+    DENIED. Never raises — denies (returns False) on a missing workspace doc, a
+    malformed members field, or any Firestore error rather than leaking data or
+    surfacing a 500 to the LLM.
+    """
+    # Personal context: no workspace specified.
+    if not workspace_id:
+        return True
+    # Malformed (non-string) workspace_id — deny (fail-closed) on a security gate.
+    if not isinstance(workspace_id, str):
+        return False
+    # The model sometimes passes the literal string "None"; treat as personal.
+    if workspace_id.lower() == "none":
+        return True
+    try:
+        ws_doc = db.collection("workspaces").document(workspace_id).get()
+    except Exception:
+        return False
+    if not ws_doc.exists:
+        return False
+    d = ws_doc.to_dict() or {}
+    if user_id and user_id == d.get("ownerId"):
+        return True
+    members = d.get("members")
+    # Guard against a corrupted non-list members field (a string would make `in`
+    # a substring match). Deny unless it's a real list containing us.
+    return isinstance(members, list) and user_id in members
+
+
 def _score_query(query: str, name: str, category: str, content: str) -> float:
     """Score a drop against a multi-token query. Returns 0.0 for no match.
     Higher score = better match. Name matches weigh most, then category, then content."""
@@ -193,7 +233,11 @@ def list_drops(user_id: str, workspace_id: str | None = None) -> str:
 
     # Handle case where model passes "None" as a string
     if workspace_id and workspace_id.lower() != "none":
-        # Workspace drops — no userId filter, all members see all drops
+        # Workspace drops — verify membership BEFORE reading. The Admin SDK
+        # bypasses firestore.rules, so workspace access must be enforced here.
+        if not _is_workspace_member(user_id, workspace_id):
+            return ACCESS_DENIED_WORKSPACE
+        # No userId filter — all members see all drops in the workspace
         docs = db.collection("drops").where("workspaceId", "==", workspace_id).stream()
     else:
         # Personal drops only (userId + workspaceId == null)
@@ -288,9 +332,8 @@ def get_drop(user_id: str, drop_id: str) -> str:
     ws_id = d.get("workspaceId")
     if ws_id:
         # Workspace drop — verify membership
-        ws_doc = db.collection("workspaces").document(ws_id).get()
-        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
-            return "Access denied — you are not a member of this workspace."
+        if not _is_workspace_member(user_id, ws_id):
+            return ACCESS_DENIED_WORKSPACE
     else:
         # Personal drop — must be owner
         if d.get("userId") != user_id:
@@ -348,9 +391,8 @@ def delete_drop(user_id: str, drop_id: str) -> str:
     # Access control: personal drops require ownership, workspace drops require membership
     ws_id = d.get("workspaceId")
     if ws_id:
-        ws_doc = db.collection("workspaces").document(ws_id).get()
-        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
-            return "Access denied — you are not a member of this workspace."
+        if not _is_workspace_member(user_id, ws_id):
+            return ACCESS_DENIED_WORKSPACE
     else:
         if d.get("userId") != user_id:
             return "Access denied — you can only delete your own drops."
@@ -376,9 +418,8 @@ def preview_drop(user_id: str, drop_id: str) -> str:
     # Access control
     ws_id = d.get("workspaceId")
     if ws_id:
-        ws_doc = db.collection("workspaces").document(ws_id).get()
-        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
-            return "Access denied — you're not a member of this workspace."
+        if not _is_workspace_member(user_id, ws_id):
+            return ACCESS_DENIED_WORKSPACE
     else:
         if d.get("userId") != user_id:
             return "Access denied — you can only preview your own drops."
@@ -421,13 +462,11 @@ def move_drop(user_id: str, drop_id: str, target_workspace_id: str) -> str:
         return f"Drop is already in that workspace."
 
     # Verify membership in source workspace
-    src_ws_doc = db.collection("workspaces").document(source_ws).get()
-    if not src_ws_doc.exists or user_id not in (src_ws_doc.to_dict().get("members") or []):
+    if not _is_workspace_member(user_id, source_ws):
         return "Access denied — you're not a member of the source workspace."
 
     # Verify membership in target workspace
-    tgt_ws_doc = db.collection("workspaces").document(target_workspace_id).get()
-    if not tgt_ws_doc.exists or user_id not in (tgt_ws_doc.to_dict().get("members") or []):
+    if not _is_workspace_member(user_id, target_workspace_id):
         return "Access denied — you're not a member of the target workspace."
 
     # Block password drops
@@ -671,6 +710,12 @@ def create_drop(
     if workspace_id and workspace_id.lower() == "none":
         workspace_id = None
 
+    # Authorization: if a workspace was specified, the caller must be a member
+    # (Admin SDK bypasses firestore.rules, so enforce workspace membership here).
+    # Personal drops (workspace_id None) are created under the caller's own userId.
+    if not _is_workspace_member(user_id, workspace_id):
+        return ACCESS_DENIED_WORKSPACE
+
     # Parse categories from comma-separated string
     category_list = []
     if categories:
@@ -887,7 +932,10 @@ def list_categories(user_id: str, workspace_id: str | None = None) -> str:
     built_in = ["password (hidden from AI)", "link"]
 
     if workspace_id:
-        # Workspace categories
+        # Workspace categories — verify membership BEFORE reading (Admin SDK
+        # bypasses firestore.rules, so enforce workspace access here).
+        if not _is_workspace_member(user_id, workspace_id):
+            return ACCESS_DENIED_WORKSPACE
         docs = db.collection("categories").where("workspaceId", "==", workspace_id).stream()
         ws_docs = db.collection("workspaces").document(workspace_id).get()
         ws_name = ws_docs.to_dict().get("name", workspace_id) if ws_docs.exists else workspace_id
@@ -952,9 +1000,8 @@ def delete_category(user_id: str, category_id: str) -> str:
     # Access control
     if ws_id:
         # Workspace category — verify membership
-        ws_doc = db.collection("workspaces").document(ws_id).get()
-        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
-            return "Access denied — you're not a member of this workspace."
+        if not _is_workspace_member(user_id, ws_id):
+            return ACCESS_DENIED_WORKSPACE
     else:
         # Personal category — must be creator
         if created_by != user_id:
@@ -1001,9 +1048,8 @@ def update_drop(
     # Access control
     ws_id = d.get("workspaceId")
     if ws_id:
-        ws_doc = db.collection("workspaces").document(ws_id).get()
-        if not ws_doc.exists or user_id not in (ws_doc.to_dict().get("members") or []):
-            return "Access denied — you're not a member of this workspace."
+        if not _is_workspace_member(user_id, ws_id):
+            return ACCESS_DENIED_WORKSPACE
     else:
         if d.get("userId") != user_id:
             return "Access denied — you can only update your own drops."
