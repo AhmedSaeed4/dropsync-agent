@@ -1,6 +1,7 @@
 import sys
 import os
 from pathlib import Path
+from typing import Literal
 
 # Add src/ to Python path so tools_server can import config
 sys.path.insert(0, str(Path(__file__).parent))
@@ -70,7 +71,10 @@ def _build_sub_env(uid: str) -> dict:
 # ── Models ──────────────────────────────────────────────────────
 
 class HistoryMessage(BaseModel):
-    role: str
+    # A client cannot inject a "system" role message — only user/assistant
+    # turns are allowed. role: "system" is rejected with HTTP 422 here, at the
+    # request boundary, before the conversation ever reaches the model.
+    role: Literal["user", "assistant"]
     content: str
 
 
@@ -183,10 +187,27 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
         )
 
     except InputGuardrailTripwireTriggered as e:
-        return ChatResponse(
-            response="I can't access drops in the 'password' category. "
-                     "To view or manage your saved passwords, please use the DropSync app directly."
-        )
+        # The guardrail carries its verdict (incl. category) in output_info.
+        # Default to the injection message if the category can't be read.
+        category = None
+        try:
+            category = (e.guardrail_result.output.output_info or {}).get("category")
+        except Exception:
+            category = None
+        if category == "password":
+            msg = (
+                "I can't open the contents of your password drops from chat — for security, "
+                "those stay private to the DropSync app. Open the app to view or manage them. "
+                "(I can still tell you how many you have if you ask for your storage stats.)"
+            )
+        else:
+            # injection — or category missing/unreadable/unknown — single safe message
+            msg = (
+                "I can't follow instructions that try to override my rules or safety settings. "
+                "If you're trying to get something done with your drops, just tell me plainly "
+                "what you need and I'll help!"
+            )
+        return ChatResponse(response=msg)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
