@@ -32,6 +32,7 @@ from difflib import SequenceMatcher
 import json
 import secrets
 import os
+import re
 
 mcp = FastMCP("dropsync-tools")
 
@@ -101,6 +102,58 @@ def _is_workspace_member(user_id: str | None, workspace_id: str | None) -> bool:
     # Guard against a corrupted non-list members field (a string would make `in`
     # a substring match). Deny unless it's a real list containing us.
     return isinstance(members, list) and user_id in members
+
+
+def _resolve_reminder(
+    reminder: str | None,
+    expires_at: datetime | None,
+    user_id: str,
+    now: datetime,
+) -> dict | str:
+    """Parse the `reminder` tool param into the 3-field Firestore patch the frontend writes
+    (TextModal.tsx:235-240). PURE: no I/O, no clock read. Single source of truth for
+    create_drop and update_drop so the offset math, the cap-vs-expiry rule, and the
+    reminderSetByUid stamping cannot drift between call sites.
+
+    Returns:
+      - {} for SKIP (reminder is None) — caller's dict.update({}) is a no-op.
+      - ON patch {reminderAt:<tz-aware UTC dt>, reminderSetByUid:user_id, reminderDismissedBy:None}.
+      - OFF patch {reminderAt:None, reminderSetByUid:None, reminderDismissedBy:None}
+        for off/none/clear/null/''.
+      - str for ERROR (unparseable, non-positive offset, malformed expires_at, or at > expires_at).
+    `expires_at` None = forever = no cap. `user_id` = trusted _verified_uid(). `now` passed in.
+    """
+    # 1. SKIP — param omitted.
+    if reminder is None:
+        return {}
+    # 2/3. OFF — explicit clear (also catches literal "None"/"Null").
+    text = reminder.strip().lower()
+    if text in {"", "off", "none", "clear", "null"}:
+        return {"reminderAt": None, "reminderSetByUid": None, "reminderDismissedBy": None}
+    # 4. Strict compact grammar <number><unit>, unit in {m,h,d}; decimals allowed.
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(m|h|d)", text)
+    if not m:
+        return ("Could not parse the reminder. Use a compact duration like '15m', '30m', "
+                "'1h', '2h', '3h', or '1d', or pass 'off' to clear.")
+    # 5/6. Offset; non-positive -> reject (useReminder.ts:124).
+    count = float(m.group(1)); unit = m.group(2)
+    offset_seconds = count * {"m": 60, "h": 3600, "d": 86400}[unit]
+    if offset_seconds <= 0:
+        return "Enter a reminder time in the future."
+    # 7. Fire time (tz-aware UTC because now is).
+    at = now + timedelta(seconds=offset_seconds)
+    # 8. Defensive: malformed expires_at must NOT raise TypeError -> 500. Normalize tz-naive to
+    #    UTC; reject non-datetime (fails closed, no write).
+    if expires_at is not None:
+        if not isinstance(expires_at, datetime):
+            return "Could not validate the reminder against this drop's expiry. Use the DropSync app."
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    # 9. Cap = STRICT `>` to EXACTLY match frontend (useReminder.ts:133). at==expiry allowed.
+    if expires_at is not None and at > expires_at:
+        return "Reminder must be before the drop expires. Use a shorter reminder or a longer expiration."
+    # 10. ON — uid stamped HERE from the trusted caller (no model channel).
+    return {"reminderAt": at, "reminderSetByUid": user_id, "reminderDismissedBy": None}
 
 
 _UID_DENIED = "Access denied — no verified user identity for this request."
@@ -660,6 +713,148 @@ def move_drop(drop_id: str, target_workspace_id: str) -> str:
 
 
 @mcp.tool()
+def copy_drop(drop_id: str, target_workspace_id: str) -> str:
+    """Duplicate a text drop into a different workspace, leaving the original and its attached
+    image in place. Workspace-to-workspace only. Content + any attached image are re-encrypted
+    end-to-end for the target. Categories preserved (missing ones auto-created in the target).
+    Contrast with move_drop (RELOCATES); copy_drop DUPLICATES (original stays).
+    Args:
+        drop_id: ID of the drop to copy.
+        target_workspace_id: ID of the target workspace (must differ from source).
+    """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
+    doc_ref = db.collection("drops").document(drop_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return f"Drop {drop_id} not found."
+    d = doc.to_dict()
+    source_ws = d.get("workspaceId")
+
+    if not source_ws:
+        return "Cannot copy personal drops via chat. Use the DropSync app."
+    if not target_workspace_id or target_workspace_id.lower() == "none":
+        return "Cannot copy to personal via chat. Use the DropSync app."
+    if source_ws == target_workspace_id:
+        return "Drop is already in that workspace. Use the DropSync app to duplicate within the same workspace."
+    if not _is_workspace_member(user_id, source_ws):
+        return "Access denied — you're not a member of the source workspace."
+    if not _is_workspace_member(user_id, target_workspace_id):
+        return "Access denied — you're not a member of the target workspace."
+    if _is_password_drop(d):
+        return PASSWORD_DENIED
+    if d.get("type") != "text":
+        return "Only text drops can be copied via chat. Use the app to copy file drops."
+
+    existing = list(db.collection("drops").where("userId", "==", user_id).limit(201).stream())
+    if len(existing) >= 200:
+        return "Cannot copy — you've reached the 200 drop limit. Delete some drops first."
+
+    src_name = _get_workspace_name(source_ws)
+    tgt_name = _get_workspace_name(target_workspace_id)
+
+    decrypted_content = decrypt_drop_content(user_id, d)
+    if not decrypted_content:
+        return "Failed to decrypt drop content. Cannot copy."
+    encrypted = encrypt_workspace_drop(user_id, target_workspace_id, decrypted_content)
+    if not encrypted:
+        return "Failed to re-encrypt content for target workspace."
+
+    # Category preserve + auto-create in TARGET (mirrors move_drop 556-594).
+    source_categories = d.get("categories") or ([d.get("category")] if d.get("category") else [])
+    if source_categories:
+        resolved_categories = []
+        custom_categories = []
+        for cat_name in source_categories:
+            if cat_name.lower().strip() in BUILT_IN_CATEGORIES:
+                resolved_categories.append(cat_name.lower().strip())
+            else:
+                custom_categories.append(cat_name)
+        if custom_categories:
+            cat_docs = list(db.collection("categories")
+                            .where("workspaceId", "==", target_workspace_id).limit(100).stream())
+            existing_categories = {}
+            for cat_doc in cat_docs:
+                data = cat_doc.to_dict()
+                existing_categories[data["name"].lower().strip()] = data["name"]
+            for cat_name in custom_categories:
+                name_lower = cat_name.lower().strip()
+                if name_lower in existing_categories:
+                    resolved_categories.append(existing_categories[name_lower])
+                else:
+                    db.collection("categories").add({
+                        "name": name_lower, "workspaceId": target_workspace_id,
+                        "createdBy": user_id, "createdAt": firestore.SERVER_TIMESTAMP,
+                    })
+                    existing_categories[name_lower] = name_lower
+                    resolved_categories.append(name_lower)
+    else:
+        resolved_categories = []
+
+    # Expiration: inherit option, RECOMPUTE expiresAt from now (fresh lifetime; never born expired).
+    opt = d.get("expirationOption")
+    if opt not in ("1h", "2h", "6h", "24h", "forever"):
+        opt = "2h"
+    now = datetime.now(timezone.utc)
+    expires_at = None if opt == "forever" else now + timedelta(hours=int(opt.replace("h", "")))
+
+    # Image re-encryption into a NEW R2 object. On ANY step failure image_fields stays {} ->
+    # copy created text-only (absent image keys == no image). Source R2 image NEVER deleted.
+    image_fields: dict = {}
+    if d.get("imageUrl") and d.get("imageIv"):
+        encrypted_image = fetch_from_r2_by_key(d.get("imageR2Key"))
+        if encrypted_image:
+            source_key = _get_workspace_key_data(source_ws)
+            if source_key:
+                decrypted_image = _decrypt_with_workspace_key(encrypted_image, d["imageIv"], source_key)
+                if decrypted_image:
+                    target_key = _get_workspace_key_data(target_workspace_id)
+                    if target_key:
+                        re_encrypted = _encrypt_with_workspace_key(decrypted_image, target_key)
+                        if re_encrypted:
+                            upload_result = upload_to_r2(re_encrypted["content"])
+                            image_fields = {
+                                "imageUrl": upload_result["url"],
+                                "imageR2Key": upload_result["key"],
+                                "imageIv": re_encrypted["iv"],
+                            }
+                            if d.get("imageSize"):
+                                image_fields["imageSize"] = d["imageSize"]
+                            if d.get("imageMimeType"):
+                                image_fields["imageMimeType"] = d["imageMimeType"]
+    # (NO else branches writing None — absent == no image on a NEW doc.)
+
+    new_doc: dict = {
+        "userId": user_id,
+        "type": "text",
+        "name": d.get("name", drop_id),
+        "content": encrypted["content"],
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "expiresAt": expires_at,
+        "expirationOption": opt,
+        "workspaceId": target_workspace_id,
+        "categories": resolved_categories,
+        "category": resolved_categories[0] if resolved_categories else None,
+        "encrypted": True,
+        "iv": encrypted["iv"],
+        "encryptedDEK": None,
+    }
+    if image_fields:
+        new_doc.update(image_fields)
+
+    new_ref = db.collection("drops").add(new_doc)
+
+    img_note = " Image was re-encrypted for the target workspace." if image_fields else ""
+    return (
+        f"Copied drop '{new_doc['name']}' (id={new_ref[1].id}) "
+        f"from '{src_name}' to '{tgt_name}'. Categories were preserved. "
+        f"Original left in place.{img_note}"
+    )
+
+
+@mcp.tool()
 def list_workspaces() -> str:
     """List all workspaces the user has access to, including their personal space.
     Returns personal space first, then all shared workspaces."""
@@ -751,6 +946,7 @@ def create_drop(
     workspace_id: str | None = None,
     categories: str | None = None,
     expiration: str = "2h",
+    reminder: str | None = None,
 ) -> str:
     """Create a new text drop. The content will be encrypted automatically.
     Cannot create drops in the 'password' category.
@@ -760,6 +956,10 @@ def create_drop(
         workspace_id: Optional workspace ID. If provided, creates in that workspace.
         categories: Comma-separated list of up to 3 categories (e.g. 'anime,notes'). Cannot include 'password'.
         expiration: When the drop expires. Options: '1h', '2h', '6h', '24h', 'forever'. Default: '2h'.
+        reminder: Optional in-app reminder as '<number><unit>' (m=minutes, h=hours, d=days).
+            Examples '15m','30m','1h','2h','3h','1d','90m','0.5d'. Decimals allowed. Omit/None
+            for no reminder; 'off'/'none' to explicitly skip. Must land before expiry (rejected
+            strictly after expiry; 'forever' has no cap). Text drops only.
     Returns confirmation with the drop ID or an error message.
     """
     user_id = _verified_uid()
@@ -802,6 +1002,11 @@ def create_drop(
     else:
         hours = int(expiration.replace("h", ""))
         expires_at = now + timedelta(hours=hours)
+
+    # Reminder (reuses the same `now` as expires_at — no skew).
+    reminder_patch = _resolve_reminder(reminder, expires_at, user_id, now)
+    if isinstance(reminder_patch, str):
+        return reminder_patch
 
     # Resolve categories — auto-create if they don't exist
     resolved_categories: list[str] = []
@@ -854,14 +1059,21 @@ def create_drop(
     if "encryptedDEK" in encrypted_fields:
         doc_data["encryptedDEK"] = encrypted_fields["encryptedDEK"]
 
+    # Add reminder ON patch (OFF/SKIP write nothing — no reminder keys on the doc).
+    if reminder_patch and reminder_patch.get("reminderAt") is not None:
+        doc_data.update(reminder_patch)
+
     # Write to Firestore
     doc_ref = db.collection("drops").add(doc_data)
 
-    return (
+    confirmation = (
         f"Created drop '{name}' (id={doc_ref[1].id})\n"
         f"Type: text | Categories: {', '.join(resolved_categories) if resolved_categories else 'none'} | Expires: {expiration}\n"
         f"Workspace: {workspace_id or 'personal'}"
     )
+    if reminder_patch and reminder_patch.get("reminderAt") is not None:
+        confirmation += f"\nReminder: set (fires ~{reminder_patch['reminderAt'].strftime('%Y-%m-%d %H:%M UTC')})"
+    return confirmation
 
 
 def _create_workspace_key(workspace_id: str) -> bool:
@@ -1093,6 +1305,7 @@ def update_drop(
     content: str | None = None,
     categories: str | None = None,
     expiration: str | None = None,
+    reminder: str | None = None,
 ) -> str:
     """Update an existing text drop. Can update name, content, categories, and/or expiration.
     - For personal drops: content updates trigger re-encryption with a new DEK.
@@ -1105,6 +1318,9 @@ def update_drop(
         content: New text content (optional, triggers re-encryption).
         categories: Comma-separated list of up to 3 category names (e.g. 'link,anime'). Pass '' to remove all.
         expiration: New expiration: '1h', '2h', '6h', '24h', 'forever' (optional).
+        reminder: Optional. Set/change a reminder with a compact duration ('15m','1h','1d',...).
+            Pass 'off'/'none' to CLEAR. Omit (None) to leave UNCHANGED. Must land before expiry
+            (rejected strictly after). Text drops only.
     """
     user_id = _verified_uid()
     if not user_id:
@@ -1142,6 +1358,28 @@ def update_drop(
         if not name.strip():
             return "Drop name cannot be empty."
         update_data["name"] = name.strip()
+
+    if expiration is not None:
+        valid_expirations = ("1h", "2h", "6h", "24h", "forever")
+        if expiration not in valid_expirations:
+            return f"Invalid expiration. Must be one of: {', '.join(valid_expirations)}"
+        update_data["expirationOption"] = expiration
+        if expiration == "forever":
+            update_data["expiresAt"] = None
+        else:
+            hours = int(expiration.replace("h", ""))
+            update_data["expiresAt"] = datetime.now(timezone.utc) + timedelta(hours=hours)
+
+    # Reminder: None=leave-unchanged; 'off'/'none'=CLEAR; duration=SET. Placed AFTER expiration
+    # (so the cap uses the NEW expiresAt when both passed) and BEFORE the categories block (the
+    # first Firestore write in this function — it auto-creates category docs), so an invalid /
+    # unparseable / over-cap reminder returns with ZERO Firestore writes (no orphan category).
+    if reminder is not None:
+        effective_expires_at = update_data.get("expiresAt") if "expiresAt" in update_data else d.get("expiresAt")
+        reminder_patch = _resolve_reminder(reminder, effective_expires_at, user_id, datetime.now(timezone.utc))
+        if isinstance(reminder_patch, str):
+            return reminder_patch
+        update_data.update(reminder_patch)
 
     if categories is not None:
         # Parse comma-separated categories
@@ -1181,17 +1419,6 @@ def update_drop(
         update_data["categories"] = resolved
         update_data["category"] = None  # Clear legacy field
 
-    if expiration is not None:
-        valid_expirations = ("1h", "2h", "6h", "24h", "forever")
-        if expiration not in valid_expirations:
-            return f"Invalid expiration. Must be one of: {', '.join(valid_expirations)}"
-        update_data["expirationOption"] = expiration
-        if expiration == "forever":
-            update_data["expiresAt"] = None
-        else:
-            hours = int(expiration.replace("h", ""))
-            update_data["expiresAt"] = datetime.now(timezone.utc) + timedelta(hours=hours)
-
     # --- Content update (requires re-encryption) ---
     if content is not None:
         if ws_id:
@@ -1225,6 +1452,12 @@ def update_drop(
         changes.append(f"expiration -> {update_data['expirationOption']}")
     if content is not None:
         changes.append("content re-encrypted")
+
+    if "reminderAt" in update_data:
+        if update_data["reminderAt"] is None:
+            changes.append("reminder cleared")
+        else:
+            changes.append(f"reminder set for {update_data['reminderAt'].strftime('%Y-%m-%d %H:%M UTC')}")
 
     return f"Updated drop {drop_id}: {', '.join(changes)}."
 
