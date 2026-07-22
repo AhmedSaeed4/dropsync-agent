@@ -187,6 +187,40 @@ def _verified_uid() -> str | None:
     return uid
 
 
+def _is_trusted_caller(user_id: str) -> bool:
+    """True iff the verified caller may create/keep NEVER-EXPIRING (forever) drops.
+
+    Mirrors firestore.rules isTrusted() (firestore.rules:6-16): the OWNER
+    (config/owner.data.uid == caller) OR a user whose users/{uid}.tier == 'trusted'.
+    DEFAULTS TO STANDARD (False) on a missing users doc, a missing/None/non-'trusted'
+    tier field, a missing config/owner doc, OR ANY Firestore read error — matching the
+    frontend copy path's fail-closed default (drag-drop-app/src/lib/drops.ts:1649-1651,
+    'default to standard on miss/error').
+
+    SECURITY: the firebase_admin Admin SDK (config.py:34) BYPASSES firestore.rules, so
+    this helper IS the sole enforcement of the (!isForeverWrite() || isTrusted()) gate
+    (firestore.rules:276 create, :291 update) for every agent write. It MUST default to
+    standard on any failure so a missing doc or transient error can never grant 'trusted'.
+    The owner uid is READ from config/owner (never hardcoded). Never raises.
+    """
+    # 1. OWNER — config/owner.uid (mirrors isOwner, firestore.rules:6-10).
+    try:
+        owner_doc = db.collection("config").document("owner").get()
+        if owner_doc.exists and (owner_doc.to_dict() or {}).get("uid") == user_id:
+            return True
+    except Exception:
+        pass  # fall through to tier read; fail-closed if that also errors
+    # 2. TIER — users/{uid}.tier == 'trusted' (mirrors firestore.rules:13-15).
+    #    Doc-miss, missing field, non-'trusted' value, or ANY error -> standard (False).
+    try:
+        user_doc = db.collection("users").document(user_id).get()
+        if user_doc.exists:
+            return (user_doc.to_dict() or {}).get("tier") == "trusted"
+    except Exception:
+        pass
+    return False
+
+
 def _score_query(query: str, name: str, category: str, content: str) -> float:
     """Score a drop against a multi-token query. Returns 0.0 for no match.
     Higher score = better match. Name matches weigh most, then category, then content."""
@@ -582,6 +616,17 @@ def move_drop(drop_id: str, target_workspace_id: str) -> str:
     if d.get("type") != "text":
         return "Only text drops can be moved via chat. Use the app to move file drops."
 
+    # Trusted-tier gate. move_drop does NOT change expiration (it cannot MINT forever — its
+    # update_data has no expirationOption/expiresAt key), but it PRESERVES it: relocating a forever
+    # source is a forever-write that firestore.rules:291 would block for a non-trusted member on a
+    # client write. The Admin SDK bypasses that, so enforce here. REJECT (not downgrade): silently
+    # shortening a trusted owner's drop to 24h on move would be data loss. The trusted owner can
+    # still move their own forever drop. Placed before any decrypt/re-encrypt/write (~589/~636/~703).
+    if (d.get("expirationOption") == "forever" or d.get("expiresAt") is None) \
+            and not _is_trusted_caller(user_id):
+        return ("This drop never expires, so only trusted users can move it. "
+                "Use the DropSync app.")
+
     # Decrypt content with source workspace key
     src_name = _get_workspace_name(source_ws)
     tgt_name = _get_workspace_name(target_workspace_id)
@@ -797,6 +842,14 @@ def copy_drop(drop_id: str, target_workspace_id: str) -> str:
     opt = d.get("expirationOption")
     if opt not in ("1h", "2h", "6h", "24h", "forever"):
         opt = "2h"
+    # Trusted-tier gate (the Admin SDK bypasses firestore.rules:276). The frontend copy path
+    # DOWNGRADES a forever source to 24h for non-trusted users (drops.ts:1645-1652) rather than
+    # rejecting — mirror that exactly so a standard copier still gets a legal 24h copy. The
+    # expires_at recompute on the next line then uses the downgraded opt. (Safe even though the
+    # category auto-create at ~787-790 ran earlier: copy DOWNGRADES, it never short-circuits/returns,
+    # so those categories belong to the successful 24h copy — no orphans.)
+    if opt == "forever" and not _is_trusted_caller(user_id):
+        opt = "24h"
     now = datetime.now(timezone.utc)
     expires_at = None if opt == "forever" else now + timedelta(hours=int(opt.replace("h", "")))
 
@@ -995,6 +1048,14 @@ def create_drop(
     valid_expirations = ("1h", "2h", "6h", "24h", "forever")
     if expiration not in valid_expirations:
         expiration = "2h"
+
+    # Trusted-tier gate (the Admin SDK bypasses firestore.rules:276, so this helper IS the
+    # enforcement of (!isForeverWrite() || isTrusted()) for agent writes). Only the owner or a
+    # trusted-tier user may create a never-expiring drop; everyone else picks a timed option.
+    # Runs before ANY Firestore write (the only write is the add() at ~1067).
+    if expiration == "forever" and not _is_trusted_caller(user_id):
+        return ("Your account isn't trusted to create drops that never expire. "
+                "Choose 1h, 2h, 6h, or 24h, or use the DropSync app to request trusted access.")
 
     now = datetime.now(timezone.utc)
     if expiration == "forever":
@@ -1363,12 +1424,30 @@ def update_drop(
         valid_expirations = ("1h", "2h", "6h", "24h", "forever")
         if expiration not in valid_expirations:
             return f"Invalid expiration. Must be one of: {', '.join(valid_expirations)}"
+        # Trusted-tier gate (the Admin SDK bypasses firestore.rules:291). Blocks a standard user
+        # from upgrading a compliant timed drop to forever. Placed BEFORE the first Firestore write
+        # in this tool (category auto-create ~1412) — same zero-orphan-write ordering the reminder
+        # block uses (comment ~1373-1376).
+        if expiration == "forever" and not _is_trusted_caller(user_id):
+            return ("Your account isn't trusted to set a drop to never expire. "
+                    "Choose 1h, 2h, 6h, or 24h.")
         update_data["expirationOption"] = expiration
         if expiration == "forever":
             update_data["expiresAt"] = None
         else:
             hours = int(expiration.replace("h", ""))
             update_data["expiresAt"] = datetime.now(timezone.utc) + timedelta(hours=hours)
+
+    # Trusted-tier parity (rules:291): a non-trusted user may not edit an existing FOREVER drop
+    # unless they also downgrade it to a timed expiry — the result drop would still be forever, and
+    # firestore.rules:291 rejects that for a non-trusted member on a client write; the Admin SDK
+    # bypasses it, so enforce here. (expiration=='forever' already rejected above; an explicit TIMED
+    # expiration downgrades the result to non-forever and is ALLOWED; this only fires when the caller
+    # did NOT pass expiration but the source is forever.) Placed before the first write (~1412).
+    if expiration is None and not _is_trusted_caller(user_id) \
+            and (d.get("expirationOption") == "forever" or d.get("expiresAt") is None):
+        return ("This drop never expires, so only trusted users can edit it. "
+                "Switch it to a timed expiry (1h/2h/6h/24h) to edit it, or use the DropSync app.")
 
     # Reminder: None=leave-unchanged; 'off'/'none'=CLEAR; duration=SET. Placed AFTER expiration
     # (so the cap uses the NEW expiresAt when both passed) and BEFORE the categories block (the
