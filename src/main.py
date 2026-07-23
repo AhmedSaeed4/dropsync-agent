@@ -17,6 +17,7 @@ from firebase_admin import auth as firebase_auth
 
 from config import run_config, MODEL_NAME, db
 from agent import dropsync_agent, knowledge_agent
+from usage_limit import admit_or_raise
 
 app = FastAPI(title="DropSync Agent API")
 
@@ -29,6 +30,7 @@ app.add_middleware(
     allow_origins=[o.strip() for o in _cors_origins],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 
@@ -94,6 +96,12 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
     """Run the DropSync agent with MCP tools and conversation history."""
+    # Per-user agent-message quota gate (trusted = unlimited; non-trusted = 5/hr + 25/day,
+    # UTC). MUST stay the first statement and OUTSIDE the try: below: on a limit hit it
+    # raises HTTPException(429) with Retry-After, which must propagate as 429 — NOT be
+    # swallowed by the catch-all `except Exception` (~L212) that would rewrite it to 500.
+    # No MCP subprocess / Runner.run / model call is spawned when this blocks.
+    await admit_or_raise(user_id)
     # Build conversation: system context + history + new message
     conversation = []
 
