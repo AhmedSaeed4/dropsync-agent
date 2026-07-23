@@ -793,10 +793,6 @@ def copy_drop(drop_id: str, target_workspace_id: str) -> str:
     if d.get("type") != "text":
         return "Only text drops can be copied via chat. Use the app to copy file drops."
 
-    existing = list(db.collection("drops").where("userId", "==", user_id).limit(201).stream())
-    if len(existing) >= 200:
-        return "Cannot copy — you've reached the 200 drop limit. Delete some drops first."
-
     src_name = _get_workspace_name(source_ws)
     tgt_name = _get_workspace_name(target_workspace_id)
 
@@ -988,7 +984,6 @@ def get_storage_stats() -> str:
         f"Password-protected: {password_count} (hidden from AI)\n"
         f"Total size: {total_size / (1024*1024):.2f} MB\n"
         f"Breakdown:\n" + "\n".join(breakdown_lines) + "\n"
-        f"Capacity: {total_drops}/200 drops"
     )
 
 
@@ -1038,11 +1033,6 @@ def create_drop(
         for cat in category_list:
             if cat.lower() == "password":
                 return PASSWORD_DENIED
-
-    # Check drop limit (max 200)
-    existing = list(db.collection("drops").where("userId", "==", user_id).limit(201).stream())
-    if len(existing) >= 200:
-        return "Cannot create drop — you've reached the 200 drop limit. Delete some drops first."
 
     # Calculate expiration
     valid_expirations = ("1h", "2h", "6h", "24h", "forever")
