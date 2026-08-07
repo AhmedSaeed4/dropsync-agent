@@ -5,7 +5,9 @@ Handles both personal drops (ECDH + AES-256-GCM) and workspace drops (shared sec
 
 import base64
 import json
+import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ec import ECDH
@@ -15,6 +17,20 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from config import db
+
+
+logger = logging.getLogger(__name__)
+_UNSET = object()
+
+
+@dataclass
+class DecryptionCache:
+    """Keys loaded once while searching a user's accessible drops."""
+
+    firestore_timeout: float | None = None
+    personal_shared_secret: bytes | None = None
+    personal_key_loaded: bool = False
+    workspace_keys: dict[str, bytes | None] = field(default_factory=dict)
 
 
 def b64d(s: str) -> bytes:
@@ -37,9 +53,10 @@ def b64e(data: bytes) -> str:
 #   shared secret → AES-GCM decrypt → DEK (base64-wrapped)
 #   DEK → AES-GCM decrypt → plaintext
 
-def _get_shared_secret(user_id: str) -> bytes | None:
+def _get_shared_secret(user_id: str, timeout: float | None = None) -> bytes | None:
     """Derive ECDH shared secret from user's own key pair (self-encryption)."""
-    uk = db.collection("userKeys").document(user_id).get()
+    get_kwargs = {"timeout": timeout} if timeout is not None else {}
+    uk = db.collection("userKeys").document(user_id).get(**get_kwargs)
     if not uk.exists:
         return None
     uk_data = uk.to_dict()
@@ -61,10 +78,16 @@ def _get_shared_secret(user_id: str) -> bytes | None:
     return private_key.exchange(ECDH(), public_key)
 
 
-def decrypt_personal_drop(user_id: str, drop_data: dict) -> str | None:
+def decrypt_personal_drop(
+    user_id: str,
+    drop_data: dict,
+    shared_secret: bytes | None | object = _UNSET,
+    timeout: float | None = None,
+) -> str | None:
     """Decrypt a personal (non-workspace) encrypted text drop."""
     try:
-        shared_secret = _get_shared_secret(user_id)
+        if shared_secret is _UNSET:
+            shared_secret = _get_shared_secret(user_id, timeout=timeout)
         if not shared_secret:
             return None
 
@@ -88,7 +111,7 @@ def decrypt_personal_drop(user_id: str, drop_data: dict) -> str | None:
         return plaintext.decode("utf-8")
 
     except Exception as e:
-        print(f"Error decrypting personal drop: {e}")
+        logger.warning("Error decrypting personal drop: %s", e)
         return None
 
 
@@ -98,28 +121,22 @@ def decrypt_personal_drop(user_id: str, drop_data: dict) -> str | None:
 #   AES key → AES-GCM decrypt → base64(workspace key)
 #   workspace key → AES-GCM decrypt → plaintext
 
-def decrypt_workspace_drop(user_id: str, drop_data: dict) -> str | None:
+def decrypt_workspace_drop(
+    user_id: str,
+    drop_data: dict,
+    workspace_key: bytes | None | object = _UNSET,
+    timeout: float | None = None,
+) -> str | None:
     """Decrypt a workspace encrypted text drop."""
     try:
         workspace_id = drop_data.get("workspaceId")
         if not workspace_id:
             return None
 
-        wk = db.collection("workspaceKeys").document(workspace_id).get()
-        if not wk.exists:
+        if workspace_key is _UNSET:
+            workspace_key = _get_workspace_key_data(workspace_id, timeout=timeout)
+        if not workspace_key:
             return None
-        wk_data = wk.to_dict()
-
-        # Derive AES key from secret (first 32 bytes)
-        secret_bytes = wk_data["keySecret"].encode("utf-8")[:32].ljust(32, b"\x00")
-
-        # Decrypt workspace key
-        wk_bytes_b64 = AESGCM(secret_bytes).decrypt(
-            b64d(wk_data["iv"]),
-            b64d(wk_data["encryptedKey"]),
-            None,
-        )
-        workspace_key = b64d(wk_bytes_b64.decode())
 
         # Decrypt content
         plaintext = AESGCM(workspace_key).decrypt(
@@ -130,7 +147,7 @@ def decrypt_workspace_drop(user_id: str, drop_data: dict) -> str | None:
         return plaintext.decode("utf-8")
 
     except Exception as e:
-        print(f"Error decrypting workspace drop: {e}")
+        logger.warning("Error decrypting workspace drop: %s", e)
         return None
 
 
@@ -180,7 +197,7 @@ def encrypt_personal_drop(user_id: str, content: str) -> dict | None:
         }
 
     except Exception as e:
-        print(f"Error encrypting personal drop: {e}")
+        logger.warning("Error encrypting personal drop: %s", e)
         return None
 
 
@@ -220,14 +237,15 @@ def encrypt_workspace_drop(user_id: str, workspace_id: str, content: str) -> dic
         }
 
     except Exception as e:
-        print(f"Error encrypting workspace drop: {e}")
+        logger.warning("Error encrypting workspace drop: %s", e)
         return None
 
 
-def _get_workspace_key_data(workspace_id: str) -> bytes | None:
+def _get_workspace_key_data(workspace_id: str, timeout: float | None = None) -> bytes | None:
     """Get raw workspace AES key bytes. Returns the key or None."""
     try:
-        wk = db.collection("workspaceKeys").document(workspace_id).get()
+        get_kwargs = {"timeout": timeout} if timeout is not None else {}
+        wk = db.collection("workspaceKeys").document(workspace_id).get(**get_kwargs)
         if not wk.exists:
             return None
         wk_data = wk.to_dict()
@@ -243,7 +261,7 @@ def _get_workspace_key_data(workspace_id: str) -> bytes | None:
         )
         return b64d(wk_bytes_b64.decode())
     except Exception as e:
-        print(f"Error getting workspace key: {e}")
+        logger.warning("Error getting workspace key: %s", e)
         return None
 
 
@@ -256,7 +274,7 @@ def _decrypt_with_workspace_key(encrypted_b64: str, iv_b64: str, key_bytes: byte
             None,
         ).decode("utf-8")
     except Exception as e:
-        print(f"Error decrypting with workspace key: {e}")
+        logger.warning("Error decrypting with workspace key: %s", e)
         return None
 
 
@@ -274,21 +292,57 @@ def _encrypt_with_workspace_key(plaintext: str, key_bytes: bytes) -> dict | None
             "iv": b64e(content_iv),
         }
     except Exception as e:
-        print(f"Error encrypting with workspace key: {e}")
+        logger.warning("Error encrypting with workspace key: %s", e)
         return None
 
 
 # ── Main entry points ────────────────────────────────────────────
 
-def decrypt_drop_content(user_id: str, drop_data: dict) -> str | None:
+def decrypt_drop_content(
+    user_id: str,
+    drop_data: dict,
+    cache: DecryptionCache | None = None,
+) -> str | None:
     """Decrypt a drop's content. Returns decrypted text or None."""
     if not drop_data.get("encrypted"):
         return drop_data.get("content")
 
     if drop_data.get("workspaceId"):
-        return decrypt_workspace_drop(user_id, drop_data)
-    else:
-        return decrypt_personal_drop(user_id, drop_data)
+        workspace_id = drop_data["workspaceId"]
+        workspace_key = None
+        if cache is not None:
+            if workspace_id not in cache.workspace_keys:
+                cache.workspace_keys[workspace_id] = _get_workspace_key_data(
+                    workspace_id,
+                    timeout=cache.firestore_timeout,
+                )
+            workspace_key = cache.workspace_keys[workspace_id]
+        return decrypt_workspace_drop(
+            user_id,
+            drop_data,
+            workspace_key=workspace_key,
+            timeout=cache.firestore_timeout if cache is not None else None,
+        )
+
+    shared_secret = _UNSET
+    if cache is not None:
+        if not cache.personal_key_loaded:
+            try:
+                cache.personal_shared_secret = _get_shared_secret(
+                    user_id,
+                    timeout=cache.firestore_timeout,
+                )
+            except Exception as e:
+                logger.warning("Error loading personal decryption key: %s", e)
+                cache.personal_shared_secret = None
+            cache.personal_key_loaded = True
+        shared_secret = cache.personal_shared_secret
+    return decrypt_personal_drop(
+        user_id,
+        drop_data,
+        shared_secret=shared_secret,
+        timeout=cache.firestore_timeout if cache is not None else None,
+    )
 
 
 def encrypt_drop_content(user_id: str, content: str, workspace_id: str | None = None) -> dict | None:
