@@ -8,6 +8,8 @@ read, or deleted through the agent.
 
 import sys
 import os
+import logging
+import time
 
 # Ensure this script's directory is on sys.path so imports work
 # regardless of the working directory of the parent process
@@ -19,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from config import db
 from authz import is_trusted_caller as _is_trusted_caller
-from decrypt import decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop, _get_workspace_key_data, _decrypt_with_workspace_key, _encrypt_with_workspace_key
+from decrypt import DecryptionCache, decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop, _get_workspace_key_data, _decrypt_with_workspace_key, _encrypt_with_workspace_key
 from r2 import fetch_from_r2, fetch_from_r2_by_key, upload_to_r2, delete_from_r2
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
@@ -36,10 +38,14 @@ import os
 import re
 
 mcp = FastMCP("dropsync-tools")
+logger = logging.getLogger(__name__)
 
 PASSWORD_DENIED = "Access denied — this drop is in the 'password' category and cannot be accessed through the AI assistant. Use the DropSync app directly."
 
 BUILT_IN_CATEGORIES = {"password", "link"}
+SEARCH_TIME_BUDGET_SECONDS = 30.0
+SEARCH_FIRESTORE_TIMEOUT_SECONDS = 5.0
+SEARCH_RESULT_LIMIT = 10
 
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -63,6 +69,39 @@ def _is_password_drop(d: dict) -> bool:
     if isinstance(cat, str) and cat.strip().lower() == "password":
         return True
     return False
+
+
+def _normalize_categories(d: dict) -> list[str]:
+    """Return canonical and legacy categories in stable, de-duplicated order."""
+    if not isinstance(d, dict):
+        return []
+
+    values = d.get("categories") if isinstance(d.get("categories"), list) else []
+    legacy = d.get("category")
+    if isinstance(legacy, str):
+        values = [*values, legacy]
+
+    categories = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        category = value.strip()
+        key = category.lower()
+        if category and key not in seen:
+            seen.add(key)
+            categories.append(category)
+    return categories
+
+
+def _is_expired_drop(d: dict, now: datetime) -> bool:
+    """Return True for drops whose Firestore expiry has passed."""
+    expires_at = d.get("expiresAt") if isinstance(d, dict) else None
+    if not isinstance(expires_at, datetime):
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= now
 
 
 ACCESS_DENIED_WORKSPACE = "Access denied — you're not a member of this workspace."
@@ -246,15 +285,33 @@ def _score_query(query: str, name: str, category: str, content: str) -> float:
     return total_score / max_possible
 
 
-def _get_workspace_name(ws_id: str) -> str:
+def _get_workspace_name(
+    ws_id: str,
+    workspace_name_cache: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> str:
     """Get workspace name from ID. Returns the ID if not found."""
-    ws = db.collection("workspaces").document(ws_id).get()
-    if ws.exists:
-        return ws.to_dict().get("name", ws_id)
-    return ws_id
+    if workspace_name_cache is not None and ws_id in workspace_name_cache:
+        return workspace_name_cache[ws_id]
+    get_kwargs = {"timeout": timeout} if timeout is not None else {}
+    try:
+        ws = db.collection("workspaces").document(ws_id).get(**get_kwargs)
+        name = ws.to_dict().get("name", ws_id) if ws.exists else ws_id
+    except Exception as exc:
+        logger.warning("Workspace name lookup failed for %s: %s", ws_id, exc)
+        name = ws_id
+    if workspace_name_cache is not None:
+        workspace_name_cache[ws_id] = name
+    return name
 
 
-def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
+def _format_drop(
+    doc_id: str,
+    d: dict,
+    content_preview: str = "",
+    workspace_name_cache: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> str:
     """Format a drop for display. Shows workspace name (ID) if not personal."""
     image_info = ""
     if d.get("imageR2Key"):
@@ -265,12 +322,14 @@ def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
             size_str = f"{size / 1024:.0f}KB"
         image_info = f", has_image={size_str}"
     ws_id = d.get("workspaceId")
-    ws_info = f"workspace={_get_workspace_name(ws_id)}({ws_id})" if ws_id else "workspace=Personal"
+    ws_name = _get_workspace_name(ws_id, workspace_name_cache, timeout) if ws_id else None
+    ws_info = f"workspace={ws_name}({ws_id})" if ws_id else "workspace=Personal"
+    categories = ", ".join(_normalize_categories(d)) or "none"
     return (
         f"- {d.get('name', 'untitled')} "
         f"(type={d.get('type', '?')}, "
         f"encrypted={d.get('encrypted', False)}, "
-        f"category={d.get('category', 'none')}, "
+        f"category={categories}, "
         f"expires={d.get('expiresAt', 'never')}"
         f"{content_preview}{image_info}, "
         f"workspace_id={ws_id or 'null'}, "
@@ -279,32 +338,85 @@ def _format_drop(doc_id: str, d: dict, content_preview: str = "") -> str:
     )
 
 
-def _get_user_workspace_ids(user_id: str) -> list[str]:
+def _get_search_timeout(deadline: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(SEARCH_FIRESTORE_TIMEOUT_SECONDS, remaining)
+
+
+def _stream_search_docs(query, deadline: float, label: str) -> tuple[list, bool]:
+    """Read all available documents until the search deadline is reached."""
+    timeout = _get_search_timeout(deadline)
+    if timeout is None:
+        return [], True
+
+    docs = []
+    try:
+        for doc in query.stream(timeout=timeout):
+            if time.monotonic() >= deadline:
+                return docs, True
+            docs.append(doc)
+        return docs, False
+    except Exception as exc:
+        logger.warning("Search query failed for %s: %s", label, exc)
+        return docs, True
+
+
+def _get_user_workspace_ids(user_id: str, deadline: float) -> tuple[list[str], bool]:
     """Get IDs of all workspaces the user is a member of."""
-    docs = db.collection("workspaces").where("members", "array_contains", user_id).stream()
-    return [doc.id for doc in docs]
+    timeout = _get_search_timeout(deadline)
+    if timeout is None:
+        return [], True
+    try:
+        docs = db.collection("workspaces").where("members", "array_contains", user_id).stream(timeout=timeout)
+        return [doc.id for doc in docs], False
+    except Exception as exc:
+        logger.warning("Workspace lookup failed during search: %s", exc)
+        return [], True
 
 
-def _get_all_accessible_drops(user_id: str) -> list:
+def _get_all_accessible_drops(
+    user_id: str,
+    deadline: float,
+) -> tuple[list, bool]:
     """Get all drops a user can access: personal drops + drops from all joined workspaces.
-    Deduplicates by document ID."""
+    Deduplicates by document ID and stops only when the search deadline is reached."""
     seen_ids = set()
     all_docs = []
+    incomplete = False
 
-    # 1. Personal drops (userId == me AND workspaceId == null)
-    for doc in db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).stream():
-        if doc.id not in seen_ids:
-            seen_ids.add(doc.id)
-            all_docs.append(doc)
-
-    # 2. Workspace drops — no userId filter, all members see all drops
-    for ws_id in _get_user_workspace_ids(user_id):
-        for doc in db.collection("drops").where("workspaceId", "==", ws_id).stream():
+    def add_query(query, label: str) -> None:
+        nonlocal incomplete
+        docs, query_incomplete = _stream_search_docs(query, deadline, label)
+        incomplete = incomplete or query_incomplete
+        for doc in docs:
             if doc.id not in seen_ids:
                 seen_ids.add(doc.id)
                 all_docs.append(doc)
 
-    return all_docs
+    # 1. Personal drops (userId == me AND workspaceId == null)
+    add_query(
+        db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None),
+        "personal drops",
+    )
+
+    if time.monotonic() >= deadline:
+        return all_docs, True
+
+    # 2. Workspace drops — no userId filter, all members see all drops
+    workspace_ids, workspace_lookup_incomplete = _get_user_workspace_ids(user_id, deadline)
+    incomplete = incomplete or workspace_lookup_incomplete
+    for ws_id in workspace_ids:
+        if time.monotonic() >= deadline:
+            incomplete = True
+            break
+        add_query(
+            db.collection("drops").where("workspaceId", "==", ws_id),
+            f"workspace {ws_id}",
+        )
+
+    return all_docs, incomplete
 
 
 # ── Tools ───────────────────────────────────────────────────────
@@ -331,6 +443,9 @@ def list_drops(workspace_id: str | None = None) -> str:
         # Personal drops only (userId + workspaceId == null)
         docs = db.collection("drops").where("userId", "==", user_id).where("workspaceId", "==", None).stream()
 
+    now = datetime.now(timezone.utc)
+    decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
+    workspace_name_cache: dict[str, str] = {}
     drops = []
     for doc in docs:
         d = doc.to_dict()
@@ -338,15 +453,25 @@ def list_drops(workspace_id: str | None = None) -> str:
         # Skip password-category drops
         if _is_password_drop(d):
             continue
+        if _is_expired_drop(d, now):
+            continue
 
         # Decrypt content for preview
         content_preview = ""
         if d.get("type") == "text" and d.get("content"):
-            decrypted = decrypt_drop_content(user_id, d)
+            decrypted = decrypt_drop_content(user_id, d, cache=decryption_cache)
             if decrypted:
                 content_preview = f", content=\"{decrypted[:60]}\""
 
-        drops.append(_format_drop(doc.id, d, content_preview))
+        drops.append(
+            _format_drop(
+                doc.id,
+                d,
+                content_preview,
+                workspace_name_cache,
+                timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS,
+            )
+        )
 
     if not drops:
         return "No drops found."
@@ -365,40 +490,73 @@ def search_drops(query: str) -> str:
 
     scored_results: list[tuple[float, str]] = []  # (score, formatted_string)
     query_lower = query.lower().strip()
+    deadline = time.monotonic() + SEARCH_TIME_BUDGET_SECONDS
+    now = datetime.now(timezone.utc)
+    decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
+    workspace_name_cache: dict[str, str] = {}
+    documents, incomplete = _get_all_accessible_drops(user_id, deadline)
 
-    for doc in _get_all_accessible_drops(user_id):
+    for doc in documents:
+        if time.monotonic() >= deadline:
+            incomplete = True
+            break
         d = doc.to_dict()
+
+        if _is_expired_drop(d, now):
+            continue
 
         # Skip password-category drops
         if _is_password_drop(d):
             continue
 
         name = d.get("name", "")
-        category = d.get("category") or ""
+        category = ", ".join(_normalize_categories(d))
 
         # Decrypt content to search through it
         decrypted_content = ""
         if d.get("type") == "text" and d.get("content"):
-            decrypted = decrypt_drop_content(user_id, d)
+            decryption_cache.firestore_timeout = _get_search_timeout(deadline)
+            if decryption_cache.firestore_timeout is None:
+                incomplete = True
+                break
+            decrypted = decrypt_drop_content(user_id, d, cache=decryption_cache)
             if decrypted:
                 decrypted_content = decrypted
 
         score = _score_query(query_lower, name, category, decrypted_content)
 
         # Minimum threshold: at least one token must match something
-        tokens = query_lower.split()
         if score > 0.05:
+            format_timeout = _get_search_timeout(deadline)
+            if format_timeout is None:
+                incomplete = True
+                break
             content_preview = f', content="{decrypted_content[:60]}"' if decrypted_content else ""
-            scored_results.append((score, _format_drop(doc.id, d, content_preview)))
+            scored_results.append((
+                score,
+                _format_drop(
+                    doc.id,
+                    d,
+                    content_preview,
+                    workspace_name_cache,
+                    timeout=format_timeout,
+                ),
+            ))
 
     if not scored_results:
+        if incomplete:
+            return f"Search incomplete for '{query}'. Try a narrower query."
         return f"No drops matching '{query}'. Try listing your drops to see what's available."
 
     # Sort by score descending, return top 10
     scored_results.sort(key=lambda x: -x[0])
-    top_results = scored_results[:10]
+    top_results = scored_results[:SEARCH_RESULT_LIMIT]
 
     output_parts = []
+    if incomplete:
+        output_parts.append(
+            f"Search incomplete for '{query}'. Showing matches found before the search limit."
+        )
     if top_results[0][0] < 0.3:
         output_parts.append(f"No exact matches for '{query}', but found similar:")
     for score, formatted in top_results:
@@ -442,7 +600,7 @@ def get_drop(drop_id: str) -> str:
         f"Type: {d.get('type', '?')}",
         f"Workspace: {_get_workspace_name(ws_id)} ({ws_id})" if ws_id else "Workspace: Personal",
         f"Encrypted: {d.get('encrypted', False)}",
-        f"Category: {d.get('category', 'none')}",
+        f"Category: {', '.join(_normalize_categories(d)) or 'none'}",
         f"Created: {d.get('createdAt', '?')}",
         f"Expires: {d.get('expiresAt', 'never')}",
         f"Size: {d.get('fileSize', 'N/A')} bytes",
