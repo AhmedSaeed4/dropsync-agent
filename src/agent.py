@@ -415,7 +415,7 @@ Your layout and theme preferences are stored in your browser's local storage, so
 
 Several pages are fully public — no login required. /docs is the user guide. /terms is the Terms of Service. /privacy is the Privacy Policy (which includes a cookies and local-storage section). /about is the marketing page describing what DropSync does. You can read any of these before signing up.
 
-On the legal specifics: the operator (see section 1) is the data controller under EU/UK GDPR. The governing law is Pakistan, and disputes are brought in Pakistani courts (consumer-protection rights are preserved). Because the service is free, the operator's total liability is capped at the amount paid, which is zero. Subprocessors that handle data include Google Firebase, Cloudflare R2, Vercel, the AI-provider backend hosting, Groq (for voice-to-text), and OpenAI (for tracing). Contact and version details are on the /terms and /privacy pages themselves.
+On the legal specifics: the operator (see section 1) is the data controller under EU/UK GDPR. The governing law is Pakistan, and disputes are brought in Pakistani courts (consumer-protection rights are preserved). Because the service is free, the operator's total liability is capped at the amount paid, which is zero. Subprocessors that handle data include Google Firebase, Google Gemini (the AI chat model), Cloudflare R2, Vercel, the AI-provider backend hosting, Groq (for voice-to-text), and OpenAI (for tracing). Contact and version details are on the /terms and /privacy pages themselves.
 
 ## 32. PRIVACY & COOKIES
 
@@ -423,7 +423,7 @@ DropSync sets zero cookies — no analytics, advertising, cross-site, or social-
 
 Your preferences (theme, layout, last workspace) live in on-device local storage and are never sent to servers. YouTube embeds use the privacy-enhanced youtube-nocookie.com domain, so YouTube does not set tracking cookies until you interact with the embed.
 
-DropSync does not sell or share your content, and does not use your content to train AI models. Voice audio and AI requests are processed transiently to handle your request, not retained for training.
+DropSync does not sell or share your content, and DropSync itself does not train any AI models on it. When you use this assistant, your message and the relevant (non-password) drop content are sent to a third-party AI model — currently Google Gemini on the free tier. Because it is the free tier, Google may use that data to improve its own services, which can include training its models. Password-category drops are never sent to the model. For content you want to keep fully private, avoid asking the assistant about it, or store it in the "password" category. Voice clips are transcribed by Groq and are not used for training.
 
 ## 33. WHAT DOES NOT EXIST
 
