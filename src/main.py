@@ -3,6 +3,9 @@ import os
 import asyncio
 import json
 import logging
+import secrets
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -247,6 +250,415 @@ class ChatResponse(BaseModel):
     previewWorkspaceId: str | None = None
 
 
+class RunStartRequest(ChatRequest):
+    # Idempotency key minted by the client per SEND: a START that failed at the
+    # network layer is retried with the SAME value and must re-attach to the
+    # same run, never start a second one (double-create risk on flaky networks).
+    client_request_id: str
+
+
+class RunStartResponse(BaseModel):
+    run_id: str
+    status: str
+
+
+class RunCancelResponse(BaseModel):
+    status: str
+
+
+# ── Resumable run registry ──────────────────────────────────────
+# The agent run is decoupled from the SSE connection: it executes as a detached
+# asyncio task and everything it would have streamed is appended to an in-memory
+# log of rendered SSE frames. A viewer (GET /chat/runs/{id}/stream) replays the
+# log from frame 0 and then follows live, so a client network hiccup just means
+# re-attaching — the finished answer is never lost, and asking twice with the
+# same client_request_id can never start two runs.
+#
+# SINGLE-PROCESS ASSUMPTION: the HF Space runs `uvicorn src.main:app` with no
+# --workers (see Dockerfile CMD), so a module-level dict IS the registry. If
+# this app ever runs with multiple workers, runs split across processes and
+# attach would 404 — move the registry to shared storage first.
+
+_RUN_TTL_SECONDS = 600.0  # finished runs stay replayable ~10 min, then lazily evicted
+_MAX_RUNS = 200           # hard cap so the registry can't grow without bound
+
+
+@dataclass
+class _ChatRun:
+    run_id: str
+    user_id: str
+    client_request_id: str
+    status: str = "running"  # running | completed | error | cancelled
+    # Ordered RENDERED SSE frames (terminal included): the log IS the stream.
+    # Storing final strings keeps replay a plain yield and the memory bounded
+    # to what was actually sent.
+    frames: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.monotonic)
+    finished_at: float | None = None
+    cancel_requested: bool = False
+    result: object | None = None      # RunResultStreaming — the genuine-cancel handle
+    task: asyncio.Task | None = None  # fallback cancel handle (pre-stream window)
+    viewers: int = 0                  # attached follow generators (blocks TTL eviction)
+
+
+_runs: dict[str, _ChatRun] = {}
+_runs_by_key: dict[tuple[str, str], str] = {}  # (user_id, client_request_id) -> run_id
+_registry_lock = asyncio.Lock()
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _sweep_runs() -> None:
+    """Evict reclaimable runs. No awaits inside → atomic on the single event loop.
+
+    Running runs are NEVER evicted (they self-terminate: the runner's ~3-min
+    keepalive bail, the 60s MCP timeout, MAX_TURNS=30). Runs with a live viewer
+    are kept so a TTL expiry mid-view doesn't yank the log out from under an
+    open stream — only a RE-attach after eviction 404s.
+    """
+    now = time.monotonic()
+    for run_id in list(_runs):
+        run = _runs[run_id]
+        if (
+            run.finished_at is not None
+            and run.viewers == 0
+            and (now - run.finished_at) > _RUN_TTL_SECONDS
+        ):
+            _runs.pop(run_id, None)
+            _runs_by_key.pop((run.user_id, run.client_request_id), None)
+    # Hard cap: drop oldest-finished-first when over budget.
+    if len(_runs) > _MAX_RUNS:
+        reclaimable = sorted(
+            (r for r in _runs.values() if r.finished_at is not None and r.viewers == 0),
+            key=lambda r: r.finished_at or 0.0,
+        )
+        for run in reclaimable[: len(_runs) - _MAX_RUNS]:
+            _runs.pop(run.run_id, None)
+            _runs_by_key.pop((run.user_id, run.client_request_id), None)
+
+
+def _finish_run(run: _ChatRun, status: str, terminal_frame: str) -> None:
+    """Land a run's terminal state. DOUBLE-FINAL GUARD: the first caller wins and
+    every later attempt (runner belt-and-braces, cancel endpoint, legacy wrapper)
+    is a no-op — a cancel racing completion can never produce two terminals.
+    The terminal frame is appended BEFORE the status flips, so a viewer polling
+    both can never observe a terminal status whose frame it cannot yet read."""
+    if run.finished_at is not None:
+        return
+    run.frames.append(terminal_frame)
+    run.finished_at = time.monotonic()
+    run.status = status
+
+
+def _get_owned_run(run_id: str, user_id: str) -> _ChatRun:
+    """Fetch a run for its owner. Unknown AND not-yours both 404 — never confirm
+    that another user's run exists."""
+    run = _runs.get(run_id)
+    if run is None or run.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+async def _start_or_get_run(
+    user_id: str, message: str, history: list[HistoryMessage], client_request_id: str
+) -> _ChatRun:
+    """Create (or idempotently return) a chat run, spawning its detached runner.
+
+    Ordering matters: the idempotency lookup runs BEFORE the quota gate so a
+    retried START (same client_request_id — e.g. its first response was lost to
+    a network hiccup) returns the existing run WITHOUT a second charge against
+    the per-hour limit. For every genuinely NEW run, admit_or_raise still runs
+    before any registry insert, MCP subprocess, or model call — its 429 +
+    Retry-After escapes as a normal JSON error before any SSE headers, exactly
+    like /chat.
+    """
+    key = (user_id, client_request_id)
+    async with _registry_lock:
+        _sweep_runs()
+        existing_id = _runs_by_key.get(key)
+        if existing_id and existing_id in _runs:
+            return _runs[existing_id]
+
+    await admit_or_raise(user_id)
+
+    async with _registry_lock:
+        _sweep_runs()
+        existing_id = _runs_by_key.get(key)
+        if existing_id and existing_id in _runs:
+            # A twin POST won the race while we awaited the quota gate.
+            return _runs[existing_id]
+        run = _ChatRun(
+            run_id=secrets.token_urlsafe(24),
+            user_id=user_id,
+            client_request_id=client_request_id,
+        )
+        run.task = asyncio.create_task(_execute_chat_run(run, user_id, message, history))
+        _runs[run.run_id] = run
+        _runs_by_key[key] = run.run_id
+        return run
+
+
+def _genuinely_cancel_run(run: _ChatRun) -> None:
+    """Stop a running run for real (Stop-button semantics — saves model quota).
+
+    Preferred handle is the SDK's result.cancel (a SYNC method in
+    openai-agents 0.13.2 — never await it), falling back to cancelling the
+    runner task in the brief pre-stream window. Always lands the terminal via
+    _finish_run (idempotent): this covers the corner where the task is
+    cancelled before its coroutine ever starts, which would otherwise leave
+    viewers hanging with no terminal at all."""
+    if run.status != "running":
+        return
+    run.cancel_requested = True
+    cancelled_frame = _sse("error", {"kind": "cancelled", "message": "Stopped."})
+    try:
+        if run.result is not None and not run.result.is_complete:
+            run.result.cancel("immediate")
+            _finish_run(run, "cancelled", cancelled_frame)
+            return
+    except Exception:
+        pass
+    if run.task is not None and not run.task.done():
+        run.task.cancel()
+    _finish_run(run, "cancelled", cancelled_frame)
+
+
+# ── Run execution ───────────────────────────────────────────────
+
+
+async def _execute_chat_run(
+    run: _ChatRun, user_id: str, message: str, history: list[HistoryMessage]
+) -> None:
+    """Detached runner — the old /chat/stream body with every `yield` turned into
+    a frames.append. It belongs to the run, not to any connection: a viewer
+    disconnect never cancels it (only _genuinely_cancel_run does), so the work
+    survives a phone network hiccup and a re-attaching viewer replays + follows.
+
+    Maintenance notes (openai-agents 0.13.2 — re-verify on any SDK upgrade):
+      - RunItemStreamEvent names used: tool_called / tool_output / message_output_created.
+        MCP tool names arrive UN-PREFIXED (agents/mcp/util.py), so they match
+        tools_server.py function names directly.
+      - Guardrail + model exceptions are RE-RAISED at the END of the stream_events()
+        iteration (RunResultStreaming._stored_exception) — the except blocks below
+        sit OUTSIDE the loop. Because this coroutine is detached from every
+        connection, no failure can ever become an HTTP 500: every path lands an
+        in-stream terminal frame.
+      - RunResultStreaming.cancel() is a SYNC method — call it without await.
+    """
+    conversation = []
+    for msg in history:
+        conversation.append({"role": msg.role, "content": msg.content})
+    conversation.append({"role": "user", "content": message})
+
+    server, request_dropsync = _new_request_agent(user_id)
+
+    # Declared before try: the finally block retires it, and an early cancel must
+    # not hit an unbound name.
+    next_event: asyncio.Task | None = None
+    try:
+        await server.connect()
+        result = Runner.run_streamed(
+            request_dropsync,
+            conversation,
+            run_config=run_config,
+            max_turns=MAX_TURNS,
+        )
+        run.result = result
+
+        last_activity: tuple | None = None  # (phase, tool) — emit only on CHANGE
+
+        def activity_frame(payload: dict) -> str | None:
+            nonlocal last_activity
+            key = (payload.get("phase"), payload.get("tool"))
+            if key == last_activity:
+                return None
+            last_activity = key
+            return _sse("activity", payload)
+
+        # Immediate "generating" so a viewer shows a label from the first moment
+        # (the client translates phases; the backend only reports them).
+        first = activity_frame({"phase": "generating"})
+        if first:
+            run.frames.append(first)
+
+        events = result.stream_events().__aiter__()
+        keepalive_streak = 0
+        streamed_text = False  # any delta sent since the last reset
+        while True:
+            if next_event is None:
+                next_event = asyncio.create_task(events.__anext__())
+            done, _pending = await asyncio.wait({next_event}, timeout=15.0)
+            if not done:
+                # Silent gap (e.g. a long-running tool — the MCP timeout is 60s).
+                # There is no connection to keep alive here, but a long streak
+                # still means something hung: bail with an error terminal
+                # instead of waiting forever (~3 minutes with no event at all).
+                keepalive_streak += 1
+                if keepalive_streak > 12:
+                    _finish_run(
+                        run,
+                        "error",
+                        _sse("error", {"kind": "busy", "message": "The assistant took too long. Please try again."}),
+                    )
+                    return
+                continue
+            keepalive_streak = 0
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                break
+            next_event = None
+
+            frame = None
+            if isinstance(event, RunItemStreamEvent):
+                if event.name in ("tool_called", "handoff_requested", "handoff_occured") and streamed_text:
+                    # The model emitted text and THEN moved on to a tool/handoff — that
+                    # text was thinking-out-loud, not the answer. Tell the client to
+                    # drop it so it never mixes into the real reply.
+                    streamed_text = False
+                    run.frames.append(_sse("delta_reset", {}))
+                if event.name == "tool_called":
+                    # The tool NAME is available the moment the model commits to the
+                    # call, BEFORE the tool executes — the "doing RIGHT NOW" signal.
+                    tool_name = getattr(event.item.raw_item, "name", None) or "tool"
+                    frame = activity_frame({"phase": "tool", "tool": tool_name})
+                elif event.name == "tool_output":
+                    frame = activity_frame({"phase": "tool_done"})
+                elif event.name == "message_output_created":
+                    frame = activity_frame({"phase": "generating"})
+            elif isinstance(event, AgentUpdatedStreamEvent):
+                # dropsync <-> knowledge handoff — a model turn either way
+                frame = activity_frame({"phase": "generating"})
+            elif isinstance(event, RawResponsesStreamEvent):
+                # ONLY answer text. The SDK also surfaces tool-call ARGUMENT deltas and
+                # reasoning deltas — they carry a .delta string too, but streaming them
+                # would type raw tool JSON into the chat bubble before the reset wipes
+                # it. Gate on the event TYPE, not the presence of .delta.
+                if getattr(event.data, "type", None) == "response.output_text.delta":
+                    delta = getattr(event.data, "delta", None)
+                    if isinstance(delta, str) and delta:
+                        streamed_text = True
+                        run.frames.append(_sse("delta", {"text": delta}))
+            if frame:
+                run.frames.append(frame)
+
+        # Iteration finished without exception → run complete; reuse /chat's
+        # post-run logic. to_thread: the firebase-admin get inside is a blocking
+        # RPC — keep it off the event loop so a slow Firestore read can't stall
+        # other concurrent runs.
+        if run.cancel_requested:
+            # A cancel landed while the final event was in flight — discard the
+            # result (Stop semantics) instead of doing the preview work.
+            _finish_run(run, "cancelled", _sse("error", {"kind": "cancelled", "message": "Stopped."}))
+            return
+        preview_drop_id, preview_ws_id = await asyncio.to_thread(_preview_from_result, result)
+        _finish_run(run, "completed", _sse("final", {
+            "response": result.final_output,
+            "previewDropId": preview_drop_id,
+            "previewWorkspaceId": preview_ws_id,
+        }))
+
+    except InputGuardrailTripwireTriggered as e:
+        _finish_run(run, "completed", _sse("final", {
+            "response": _guardrail_message(e),
+            "previewDropId": None,
+            "previewWorkspaceId": None,
+        }))
+
+    except MaxTurnsExceeded:
+        # Step budget exhausted — an assistant-voice explanation delivered as a
+        # normal final reply, not an in-stream error.
+        _finish_run(run, "completed", _sse("final", {
+            "response": _MAX_TURNS_MESSAGE,
+            "previewDropId": None,
+            "previewWorkspaceId": None,
+        }))
+
+    except asyncio.CancelledError:
+        # The runner task itself was cancelled (the fallback cancel path).
+        # Swallowing is legal — a task may complete normally after catching
+        # CancelledError — and required here so the terminal always lands for
+        # waiting viewers.
+        _finish_run(run, "cancelled", _sse("error", {"kind": "cancelled", "message": "Stopped."}))
+
+    except Exception as e:
+        # Never forward str(e) (provider/model internals) to the browser — log
+        # the real cause and land a classified in-stream error instead.
+        _log.exception("chat run: run failed")
+        kind, message = _classify_provider_error(e)
+        _finish_run(run, "error", _sse("error", {"kind": kind, "message": message}))
+
+    finally:
+        # Retire the pending __anext__ task so a mid-run exit never leaves it
+        # dangling; consume any stored exception so asyncio doesn't log
+        # "exception was never retrieved".
+        if next_event is not None:
+            if not next_event.done():
+                next_event.cancel()
+            else:
+                try:
+                    next_event.exception()
+                except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                    pass
+
+        async def _teardown() -> None:
+            # Subprocess cleanup ONLY — run cancellation is exclusively
+            # _genuinely_cancel_run's job. Cancelling an already-finished run
+            # reaches into the response machinery and splashes a bogus
+            # "Exception in ASGI application" into the log.
+            await server.cleanup()
+
+        # Shielded: if this coroutine is being cancelled right now, the shield
+        # lets the subprocess cleanup finish anyway.
+        try:
+            await asyncio.shield(_teardown())
+        except Exception:
+            pass
+
+        # Belt-and-braces: no code path may leave a run without a terminal — a
+        # viewer would keepalive forever. Every path above lands one; this only
+        # catches a hypothetical bug.
+        if run.finished_at is None:
+            _finish_run(run, "error", _sse("error", {"kind": "busy", "message": "The assistant stopped unexpectedly. Please try again."}))
+
+
+async def _follow_run(run: _ChatRun):
+    """SSE view onto a run: replay the whole frame log, then follow live until the
+    terminal frame is delivered. Shared by GET /chat/runs/{id}/stream and the
+    legacy /chat/stream wrapper.
+
+    Deliberately polling (0.25s tick): the log is append-only and each viewer
+    keeps a private cursor, which makes multi-viewer replay trivially safe —
+    the ≤250ms added latency is imperceptible behind the frontend's smooth-
+    reveal buffering. Keepalive comments are per-viewer (never stored in the
+    log) and double as liveness probes: a write to a dead socket lets Starlette
+    cancel this generator. No viewer-side bail cap — the runner self-terminates
+    (~3 min) and the terminal it lands is what closes us."""
+    cursor = 0
+    last_emit = time.monotonic()
+    run.viewers += 1
+    try:
+        while True:
+            new = run.frames[cursor:]
+            if new:
+                cursor += len(new)
+                for frame in new:
+                    yield frame
+                last_emit = time.monotonic()
+                continue
+            if run.status != "running":
+                return  # terminal frame delivered above — close
+            if time.monotonic() - last_emit >= 15.0:
+                yield ": keepalive\n\n"
+                last_emit = time.monotonic()
+                continue
+            await asyncio.sleep(0.25)
+    finally:
+        run.viewers -= 1
+
+
 # ── Endpoints ───────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
@@ -313,11 +725,60 @@ async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
         await server.cleanup()
 
 
+@app.post("/chat/runs", response_model=RunStartResponse)
+async def start_chat_run(req: RunStartRequest, user_id: str = Depends(verify_user)):
+    """Start (or idempotently resume) a resumable chat run.
+
+    Returns a run ticket immediately; the agent work happens in a detached task
+    and its stream is (re)read via GET /chat/runs/{run_id}/stream — a client
+    network hiccup just re-attaches and replays, it never loses the answer.
+    Re-sending the SAME client_request_id returns the SAME run (no second run,
+    no second quota charge); the quota gate runs only for genuinely new runs.
+    """
+    run = await _start_or_get_run(user_id, req.message, req.history, req.client_request_id)
+    return RunStartResponse(run_id=run.run_id, status=run.status)
+
+
+@app.get("/chat/runs/{run_id}/stream")
+async def stream_chat_run(run_id: str, user_id: str = Depends(verify_user)):
+    """SSE view onto a run — same frame vocabulary as /chat/stream. Replays the
+    full log from frame 0, then follows live until the terminal frame. Attaching
+    to an already-finished run replays instantly and closes. No quota gate:
+    attaching to an existing run is free. Unknown or not-yours → 404 (never
+    confirm another user's run exists) — the client treats attach-404 as a
+    give-up signal (run evicted after ~10 min, or the Space restarted)."""
+    run = _get_owned_run(run_id, user_id)
+    _sweep_runs()
+    return StreamingResponse(
+        _follow_run(run),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # nginx-style proxies: do not buffer this stream
+        },
+    )
+
+
+@app.post("/chat/runs/{run_id}/cancel", response_model=RunCancelResponse)
+async def cancel_chat_run(run_id: str, user_id: str = Depends(verify_user)):
+    """Genuinely stop a run (Stop button / panel close — saves model quota).
+    Idempotent: a run that already reached its terminal returns its status
+    untouched; cancel racing completion resolves to whichever landed first."""
+    run = _get_owned_run(run_id, user_id)
+    _sweep_runs()
+    if run.status == "running":
+        _genuinely_cancel_run(run)
+        return RunCancelResponse(status="cancelled")
+    return RunCancelResponse(status=run.status)
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, user_id: str = Depends(verify_user)):
-    """Streaming variant of /chat: same auth, quota gate, agent setup, and final payload —
-    but the response is a text/event-stream that reports what the agent is doing while it
-    works. Consumed by src/lib/agentActivity.ts in the frontend.
+    """Streaming variant of /chat: same auth, quota gate, agent setup, and final
+    payload — but the response is a text/event-stream that reports what the agent
+    is doing while it works. Consumed by src/lib/agentActivity.ts in the frontend
+    (one-shot path / deploy-order fallback; new clients use POST /chat/runs +
+    GET /chat/runs/{id}/stream so they can reconnect after a network hiccup).
 
     Wire contract:
       event: activity  data: {"phase": "generating"}                       — model turn / handoff
@@ -331,194 +792,40 @@ async def chat_stream(req: ChatRequest, user_id: str = Depends(verify_user)):
                                                                           = saved error turn (SSE 200 already sent)
       ": keepalive" comment frames during silent gaps (ignored by SSE parsers)
 
-    Maintenance notes (openai-agents 0.13.2 — re-verify on any SDK upgrade):
-      - RunItemStreamEvent names used: tool_called / tool_output / message_output_created.
-        MCP tool names arrive UN-PREFIXED (agents/mcp/util.py), so they match tools_server.py
-        function names directly.
-      - Guardrail + model exceptions are RE-RAISED at the END of the stream_events()
-        iteration (RunResultStreaming._stored_exception) — caught around the async-for,
-        after the SSE 200 headers are already committed.
-      - Client disconnect (Stop button / panel close): Starlette cancels this generator;
-        the finally block cancels the run and cleans the MCP subprocess inside a shielded
-        task so the cancellation of THIS task can't cut cleanup short.
-      - NEVER add GZip/compression middleware to this app — it buffers text/event-stream.
+    Implementation notes:
+      - Thin wrapper over the resumable-run machinery: start a run (quota gate
+        inside _start_or_get_run — its 429 + Retry-After still escapes as JSON
+        BEFORE any SSE headers; a fresh internal client_request_id per POST,
+        because old clients send none) and attach to it in one response.
+      - Client disconnect (Stop button / panel close) STILL genuinely cancels
+        the run — the quota-saving behavior of the old implementation: the only
+        viewer of a legacy run is gone and old clients can never re-attach.
+      - One observable delta vs the old inline implementation: an MCP
+        server.connect() failure now surfaces as an in-stream error event
+        instead of a pre-stream HTTP 500 (the run executes detached) — same
+        client outcome (saved error turn).
+      - NEVER add GZip/compression middleware to this app — it buffers
+        text/event-stream.
     """
-    # Per-user quota gate. MUST stay the first statement so a 429 + Retry-After goes out as
-    # a normal JSON error BEFORE the stream starts (headers still mutable), exactly like
-    # /chat. No MCP subprocess / model call is spawned when this blocks.
-    await admit_or_raise(user_id)
+    run = await _start_or_get_run(user_id, req.message, req.history, secrets.token_urlsafe(24))
 
-    conversation = []
-    for msg in req.history:
-        conversation.append({"role": msg.role, "content": msg.content})
-    conversation.append({"role": "user", "content": req.message})
-
-    server, request_dropsync = _new_request_agent(user_id)
-    await server.connect()
-
-    # Sync factory: starts the run; events are consumed from result.stream_events() below.
-    result = Runner.run_streamed(
-        request_dropsync,
-        conversation,
-        run_config=run_config,
-        max_turns=MAX_TURNS,
-    )
-
-    def _sse(event: str, data: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-    async def event_stream():
-        last_activity: tuple | None = None  # (phase, tool) — emit only on CHANGE, not per event
-
-        def activity_frame(payload: dict) -> str | None:
-            nonlocal last_activity
-            key = (payload.get("phase"), payload.get("tool"))
-            if key == last_activity:
-                return None
-            last_activity = key
-            return _sse("activity", payload)
-
-        # Declared before try: the finally block retires it, and a client disconnect at the
-        # very first yield must not hit an unbound name.
-        next_event: asyncio.Task | None = None
-        # True only when the generator was cancelled (client disconnect). result.cancel()
-        # must fire on THAT path only — cancelling an already-finished run (normal final,
-        # guardrail, MaxTurnsExceeded, error) reaches into the response machinery and
-        # splashes a bogus "Exception in ASGI application" into the log.
+    async def legacy_attach():
         client_gone = False
         try:
-            # Immediate "generating" so the client shows a label from the first moment
-            # (the client translates phases; the backend only reports them).
-            first = activity_frame({"phase": "generating"})
-            if first:
-                yield first
-
-            events = result.stream_events().__aiter__()
-            keepalive_streak = 0
-            streamed_text = False  # any delta sent since the last reset
-            while True:
-                if next_event is None:
-                    next_event = asyncio.create_task(events.__anext__())
-                done, _pending = await asyncio.wait({next_event}, timeout=15.0)
-                if not done:
-                    # Silent gap (e.g. a long-running tool — the MCP timeout is 60s): emit an
-                    # SSE comment frame so proxies don't idle out the connection. A long
-                    # streak means something hung: bail instead of keepalive-ing forever.
-                    keepalive_streak += 1
-                    if keepalive_streak > 12:  # ~3 minutes with no event at all
-                        yield _sse("error", {"kind": "busy", "message": "The assistant took too long. Please try again."})
-                        return
-                    yield ": keepalive\n\n"
-                    continue
-                keepalive_streak = 0
-                try:
-                    event = next_event.result()
-                except StopAsyncIteration:
-                    break
-                next_event = None
-
-                frame = None
-                if isinstance(event, RunItemStreamEvent):
-                    if event.name in ("tool_called", "handoff_requested", "handoff_occured") and streamed_text:
-                        # The model emitted text and THEN moved on to a tool/handoff — that
-                        # text was thinking-out-loud, not the answer. Tell the client to
-                        # drop it so it never mixes into the real reply.
-                        streamed_text = False
-                        yield _sse("delta_reset", {})
-                    if event.name == "tool_called":
-                        # The tool NAME is available the moment the model commits to the
-                        # call, BEFORE the tool executes — the "doing RIGHT NOW" signal.
-                        tool_name = getattr(event.item.raw_item, "name", None) or "tool"
-                        frame = activity_frame({"phase": "tool", "tool": tool_name})
-                    elif event.name == "tool_output":
-                        frame = activity_frame({"phase": "tool_done"})
-                    elif event.name == "message_output_created":
-                        frame = activity_frame({"phase": "generating"})
-                elif isinstance(event, AgentUpdatedStreamEvent):
-                    # dropsync <-> knowledge handoff — a model turn either way
-                    frame = activity_frame({"phase": "generating"})
-                elif isinstance(event, RawResponsesStreamEvent):
-                    # ONLY answer text. The SDK also surfaces tool-call ARGUMENT deltas and
-                    # reasoning deltas — they carry a .delta string too, but streaming them
-                    # would type raw tool JSON into the chat bubble before the reset wipes
-                    # it. Gate on the event TYPE, not the presence of .delta.
-                    if getattr(event.data, "type", None) == "response.output_text.delta":
-                        delta = getattr(event.data, "delta", None)
-                        if isinstance(delta, str) and delta:
-                            streamed_text = True
-                            yield _sse("delta", {"text": delta})
-                if frame:
-                    yield frame
-
-            # Iteration finished without exception → run complete; reuse /chat's post-run logic.
-            # to_thread: the firebase-admin get inside is a blocking RPC — keep it off the
-            # event loop so a slow Firestore read can't stall other concurrent streams.
-            preview_drop_id, preview_ws_id = await asyncio.to_thread(_preview_from_result, result)
-            yield _sse("final", {
-                "response": result.final_output,
-                "previewDropId": preview_drop_id,
-                "previewWorkspaceId": preview_ws_id,
-            })
-
-        except InputGuardrailTripwireTriggered as e:
-            yield _sse("final", {
-                "response": _guardrail_message(e),
-                "previewDropId": None,
-                "previewWorkspaceId": None,
-            })
-
-        except MaxTurnsExceeded:
-            # Step budget exhausted — an assistant-voice explanation delivered as a normal
-            # final reply, not an in-stream error.
-            yield _sse("final", {
-                "response": _MAX_TURNS_MESSAGE,
-                "previewDropId": None,
-                "previewWorkspaceId": None,
-            })
-
+            async for frame in _follow_run(run):
+                yield frame
         except asyncio.CancelledError:
             client_gone = True
-            raise  # client disconnected — the finally block does the cleanup
-
-        except Exception as e:
-            # The SSE 200 is already committed, so surface a safe in-stream error instead
-            # of a 500. Rate limits / provider overload get their own kind so the client
-            # shows a transient notice instead of saving an error turn. Never forward
-            # str(e) (provider/model internals) to the browser — log it instead.
-            _log.exception("chat/stream: run failed")
-            kind, message = _classify_provider_error(e)
-            yield _sse("error", {"kind": kind, "message": message})
-
+            raise
         finally:
-            # Retire the pending __anext__ task so a mid-stream generator exit (client
-            # disconnect) never leaves it dangling; consume any stored exception so asyncio
-            # doesn't log "exception was never retrieved".
-            if next_event is not None:
-                if not next_event.done():
-                    next_event.cancel()
-                else:
-                    try:
-                        next_event.exception()
-                    except (asyncio.CancelledError, StopAsyncIteration, Exception):
-                        pass
-
-            async def _teardown() -> None:
-                if client_gone and not result.is_complete:
-                    try:
-                        await result.cancel("immediate")
-                    except Exception:
-                        pass
-                await server.cleanup()
-
-            # Shielded: when the client disconnects, THIS generator is being cancelled at the
-            # same moment — the shield lets the run-cancel + subprocess cleanup finish anyway.
-            try:
-                await asyncio.shield(_teardown())
-            except Exception:
-                pass
+            # Old-client disconnect semantics preserved: no re-attach is coming,
+            # so stop the run instead of burning model quota into the void. The
+            # cancel calls are synchronous — nothing here needs shielding.
+            if client_gone:
+                _genuinely_cancel_run(run)
 
     return StreamingResponse(
-        event_stream(),
+        legacy_attach(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
