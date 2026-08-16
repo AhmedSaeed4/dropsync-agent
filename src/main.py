@@ -264,6 +264,11 @@ class RunStartResponse(BaseModel):
 
 class RunCancelResponse(BaseModel):
     status: str
+    # Stop-memory: what the run had accomplished when it was stopped. Present ONLY on
+    # the response whose call actually performed the cancel — a second (idempotent)
+    # cancel returns no summary, so exactly one client can ever receive it and there
+    # is exactly one writer of the saved stop turn. Additive: old clients ignore it.
+    summary: str | None = None
 
 
 # ── Resumable run registry ──────────────────────────────────────
@@ -299,6 +304,7 @@ class _ChatRun:
     result: object | None = None      # RunResultStreaming — the genuine-cancel handle
     task: asyncio.Task | None = None  # fallback cancel handle (pre-stream window)
     viewers: int = 0                  # attached follow generators (blocks TTL eviction)
+    cancel_summary: str | None = None  # stop-memory: what the run had done when stopped
 
 
 _runs: dict[str, _ChatRun] = {}
@@ -400,6 +406,229 @@ async def _start_or_get_run(
         return run
 
 
+# ── Stop-memory (what had the run done when the user stopped it) ──────────
+# The next message's history must tell the model the previous run was stopped and
+# what ACTUALLY happened. These tables only ever name tools from tools_server.py;
+# unknown tool names (handoffs surface as "transfer_to_…" calls) are skipped so no
+# SDK-internal name ever reaches the user or the model. When adding a tool to
+# tools_server.py, add it to these tables in the same PR — a missing entry silently
+# under-reports (never mis-reports).
+
+# A mutating call only counts as DONE when its output starts with the exact success
+# line our own tool prints — the model can call delete_drop and get "Access denied"
+# back, and claiming a deletion that failed would be fabrication.
+_STOP_SUCCESS_PREFIXES = {
+    "delete_drop": "Deleted drop '",
+    "create_drop": "Created drop '",
+    "update_drop": "Updated drop ",
+    "move_drop": "Moved drop '",
+    "copy_drop": "Copied drop '",
+    "create_workspace": "Created workspace '",
+    "join_workspace": "Joined workspace '",
+    "delete_category": "Deleted category '",
+}
+_STOP_MUTATING_VERBS = {  # tool -> past-tense verb for the summary line
+    "delete_drop": "Deleted",
+    "create_drop": "Created",
+    "update_drop": "Updated",
+    "move_drop": "Moved",
+    "copy_drop": "Copied",
+    "create_workspace": "Created (workspace)",
+    "join_workspace": "Joined (workspace)",
+    "delete_category": "Deleted (category)",
+}
+_STOP_READ_ONLY_LABELS = {  # tools that change nothing — reported as counts only
+    "search_drops": "searched your drops",
+    "list_drops": "listed your drops",
+    "get_drop": "looked up a drop",
+    "preview_drop": "opened a drop in the app",
+    "list_workspaces": "listed your workspaces",
+    "list_categories": "listed your categories",
+    "get_storage_stats": "checked your storage stats",
+}
+_STOP_TOOL_PHRASES = {  # tool -> human phrase: raw SDK tool names must NEVER reach the user
+    "delete_drop": "drop deletion",
+    "create_drop": "drop creation",
+    "update_drop": "drop update",
+    "move_drop": "drop move",
+    "copy_drop": "drop copy",
+    "create_workspace": "workspace creation",
+    "join_workspace": "workspace join",
+    "delete_category": "category deletion",
+    "search_drops": "drop search",
+    "list_drops": "drop listing",
+    "get_drop": "drop lookup",
+    "preview_drop": "drop preview",
+    "list_workspaces": "workspace listing",
+    "list_categories": "category listing",
+    "get_storage_stats": "storage stats check",
+}
+_MAX_STOP_NAMES = 6  # cap per action line — keeps the turn compact for UI and history
+
+
+def _stop_call_id(raw) -> str | None:
+    """Read a tool item's call_id, dict-aware: the SDK's output items carry a PLAIN
+    DICT raw_item ({"call_id":…, "output":…, "type":"function_call_output"}) while
+    call items carry pydantic objects — getattr alone silently misses the dict
+    shape, which once unpaired every output from its call (all actions read as
+    "unconfirmed"). Never assume one shape."""
+    if isinstance(raw, dict):
+        cid = raw.get("call_id")
+        return cid if isinstance(cid, str) else None
+    cid = getattr(raw, "call_id", None)
+    return cid if isinstance(cid, str) else None
+
+
+def _stop_output_text(output_item) -> str | None:
+    """Best-effort plain-text view of one completed tool call's output.
+
+    The exact shape differs across the MCP → FunctionTool paths in openai-agents
+    0.13.2: item.output is a {"type":"text","text":…} dict (MCP single-text) or a
+    plain str, and raw_item is a PLAIN DICT whose "output" is a stringified copy.
+    Take whichever candidate yields a string and otherwise return None — the caller
+    then degrades to an "unconfirmed" phrasing instead of guessing. Never returns
+    raw dicts: the summary is user-visible AND replayed to the model as history.
+    """
+    raw = getattr(output_item, "raw_item", None)
+    raw_out = raw.get("output") if isinstance(raw, dict) else getattr(raw, "output", None)
+    for candidate in (getattr(output_item, "output", None), raw_out):
+        if isinstance(candidate, str):
+            return candidate
+        if isinstance(candidate, dict):
+            text = candidate.get("text")
+            if isinstance(text, str):
+                return text
+    return None
+
+
+def _stop_success_label(tool: str, output: str, args: dict) -> str:
+    """Short label for a VERIFIED tool success. Prefers the name our own tool
+    printed inside single quotes (reading our own output, never guessing), then
+    the call's arguments, then a bare id — the honesty ladder. NEVER fabricates."""
+    if tool != "update_drop" and "'" in output:
+        name = output.split("'", 1)[1].split("'", 1)[0].strip()
+        if name:
+            return f'"{name[:80]}"'
+    # update_drop prints the drop_id, not a name — prefer an explicit new name
+    # from the arguments when the model passed one.
+    if tool == "update_drop":
+        name = args.get("name")
+        if isinstance(name, str) and name.strip():
+            return f'"{name.strip()[:80]}"'
+    for key in ("drop_id", "category_id", "workspace_id"):
+        val = args.get(key)
+        if isinstance(val, str) and val:
+            return f"{key.replace('_', ' ')} {val}"
+    return "an item"
+
+
+def _summarize_stopped_run(run: "_ChatRun") -> str:
+    """Build the Stop-memory summary from data already in memory — zero model
+    calls, zero I/O, zero quota. Must stay fully synchronous.
+
+    SOURCES (verified against openai-agents 0.13.2, run_internal/run_loop.py:941):
+      - run.result.new_items: extended only at END of a turn, so every tool call in
+        it already executed; its paired output item lets us verify success and pull
+        real drop names from our own tool success lines. Never derive the in-flight
+        state from here — the in-flight turn's items are missing by design.
+      - run.frames: the live activity log; if the LAST activity phase is "tool", a
+        call was in flight at stop time.
+    HONESTY: a call counts as done only when its output matches a known success
+    prefix; everything else is "unconfirmed" or "may have been mid-way". We never
+    claim an action whose success we couldn't read, and never include raw JSON,
+    ids beyond what a tool argument carried, or any exception text.
+    """
+    calls: dict[str, dict] = {}
+    order: list[str] = []
+    outputs: dict[str, str | None] = {}
+    result = run.result
+    if result is not None:
+        for item in getattr(result, "new_items", None) or []:
+            raw = getattr(item, "raw_item", None)
+            if raw is None:
+                continue
+            call_id = _stop_call_id(raw)
+            name = getattr(raw, "name", None)
+            if isinstance(name, str) and name:
+                if name.startswith("transfer_to_") or call_id is None or call_id in calls:
+                    continue  # handoff call (not a data tool) or duplicate call item
+                args_raw = getattr(raw, "arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                calls[call_id] = {"tool": name, "args": args}
+                order.append(call_id)
+            elif call_id is not None and call_id in calls:
+                outputs[call_id] = _stop_output_text(item)
+
+    verified: dict[str, list[str]] = {}
+    unconfirmed: dict[str, int] = {}
+    read_only: dict[str, int] = {}
+    for cid in order:
+        tool = calls[cid]["tool"]
+        out = outputs.get(cid)
+        prefix = _STOP_SUCCESS_PREFIXES.get(tool)
+        if prefix is not None and out is not None and out.startswith(prefix):
+            verified.setdefault(_STOP_MUTATING_VERBS[tool], []).append(
+                _stop_success_label(tool, out, calls[cid]["args"])
+            )
+        elif tool in _STOP_READ_ONLY_LABELS:
+            read_only[tool] = read_only.get(tool, 0) + 1
+        elif prefix is not None:
+            unconfirmed[tool] = unconfirmed.get(tool, 0) + 1
+        # unknown future tool names are omitted entirely (see tables' comment)
+
+    in_flight_tool = None
+    for frame in run.frames:
+        if not frame.startswith("event: activity\n"):
+            continue
+        for line in frame.split("\n"):
+            if not line.startswith("data:"):
+                continue
+            try:
+                data = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            phase = data.get("phase")
+            if phase == "tool" and isinstance(data.get("tool"), str):
+                in_flight_tool = data["tool"]
+            elif phase in ("tool_done", "generating"):
+                in_flight_tool = None
+
+    if not verified and not unconfirmed and not read_only and in_flight_tool is None:
+        return ("I was stopped before I could start working on this request — "
+                "nothing was searched, created, changed, or deleted.")
+
+    lines = ["I was stopped partway through your request. Here's what I had already done:"]
+    for verb, labels in verified.items():
+        shown = ", ".join(labels[:_MAX_STOP_NAMES])
+        extra = len(labels) - _MAX_STOP_NAMES
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(f"- {verb} {len(labels)}: {shown}{suffix}")
+    for tool, count in unconfirmed.items():
+        # Phrase, never the raw tool name — unconfirmed only holds prefix-table tools.
+        phrase = _STOP_TOOL_PHRASES[tool]
+        if count > 1:
+            plural_phrase = phrase[:-1] + "ies" if phrase.endswith("y") else phrase + "s"
+            lines.append(f"- Also attempted {count} {plural_phrase} whose results I couldn't confirm.")
+        else:
+            lines.append(f"- Also attempted {count} {phrase} whose result I couldn't confirm.")
+    for tool, count in read_only.items():
+        times = f" ({count} times)" if count > 1 else ""
+        lines.append(f"- Also {_STOP_READ_ONLY_LABELS[tool]}{times}.")
+    if in_flight_tool:
+        # "may": frames can be a fraction of a second ahead of new_items, so this
+        # call either just started or just finished — we genuinely don't know which.
+        phrase = _STOP_TOOL_PHRASES.get(in_flight_tool, "tool step")
+        lines.append(f"I may have been in the middle of another {phrase} when "
+                     "stopped — if so, it may or may not have completed, so please double-check.")
+    lines.append("Anything not listed above was not done.")
+    return "\n".join(lines)
+
+
 def _genuinely_cancel_run(run: _ChatRun) -> None:
     """Stop a running run for real (Stop-button semantics — saves model quota).
 
@@ -412,6 +641,15 @@ def _genuinely_cancel_run(run: _ChatRun) -> None:
     if run.status != "running":
         return
     run.cancel_requested = True
+    # Snapshot what the run had actually accomplished BEFORE any teardown. This
+    # function is fully synchronous (no awaits), so the runner task cannot
+    # interleave on the single event loop — the snapshot is atomic. Wrapped so a
+    # summary bug can never break the cancel itself (the terminal MUST land).
+    try:
+        run.cancel_summary = _summarize_stopped_run(run)
+    except Exception:
+        _log.exception("chat run: cancel summary failed")
+        run.cancel_summary = None
     cancelled_frame = _sse("error", {"kind": "cancelled", "message": "Stopped."})
     try:
         if run.result is not None and not run.result.is_complete:
@@ -763,12 +1001,17 @@ async def stream_chat_run(run_id: str, user_id: str = Depends(verify_user)):
 async def cancel_chat_run(run_id: str, user_id: str = Depends(verify_user)):
     """Genuinely stop a run (Stop button / panel close — saves model quota).
     Idempotent: a run that already reached its terminal returns its status
-    untouched; cancel racing completion resolves to whichever landed first."""
+    untouched; cancel racing completion resolves to whichever landed first.
+
+    The stop-memory summary is returned ONLY when this call genuinely cancelled
+    the run — a run that already finished, or a second (idempotent) cancel,
+    returns its status without a summary, so exactly one client can ever save
+    the stop turn (single writer)."""
     run = _get_owned_run(run_id, user_id)
     _sweep_runs()
     if run.status == "running":
         _genuinely_cancel_run(run)
-        return RunCancelResponse(status="cancelled")
+        return RunCancelResponse(status="cancelled", summary=run.cancel_summary)
     return RunCancelResponse(status=run.status)
 
 
