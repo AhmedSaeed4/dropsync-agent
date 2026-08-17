@@ -10,6 +10,9 @@ import sys
 import os
 import logging
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # Ensure this script's directory is on sys.path so imports work
 # regardless of the working directory of the parent process
@@ -46,6 +49,16 @@ BUILT_IN_CATEGORIES = {"password", "link"}
 SEARCH_TIME_BUDGET_SECONDS = 30.0
 SEARCH_FIRESTORE_TIMEOUT_SECONDS = 5.0
 SEARCH_RESULT_LIMIT = 10
+
+# YouTube title lookups (keyless oEmbed). Fetched titles are cached per video
+# in Firestore, so each video is requested from YouTube at most once, ever.
+YOUTUBE_FETCH_CAP = 15          # max fresh YouTube fetches per tool call
+YOUTUBE_FETCH_DELAY = 0.4       # seconds between fetches (browse, don't hammer)
+YOUTUBE_REQUEST_TIMEOUT = 8.0   # seconds per HTTP request to YouTube
+YOUTUBE_TIME_BUDGET = 40.0      # whole-call budget (the MCP layer kills at 60s)
+YOUTUBE_DESC_PREVIEW = 300      # description preview chars (dormant until a key is set)
+YOUTUBE_INPUT_LIMIT = 50        # max links processed per call
+YOUTUBE_CACHE_COLLECTION = "youtubeTitles"
 
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -417,6 +430,179 @@ def _get_all_accessible_drops(
         )
 
     return all_docs, incomplete
+
+
+# ── YouTube helpers ─────────────────────────────────────────────
+
+_YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com",
+}
+
+
+def _extract_youtube_video_id(text: str) -> str | None:
+    """Parse one YouTube URL (or a bare 11-char video ID) into its video ID.
+
+    Accepts watch?v=, youtu.be/, /shorts/, /live/, /embed/, and /v/ links with
+    any extra params. Returns None for anything that isn't a YouTube video
+    link — callers report those as skipped rather than guessing.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    # Bare video ID (the model sometimes strips the URL down to just this)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", t):
+        return t
+    m = re.match(r"^(?:https?://)?([^/?#\s]+)", t, re.IGNORECASE)
+    if not m:
+        return None
+    host = m.group(1).lower().split(":")[0]  # strip a port if present
+    rest = t[m.end():]
+    if host == "youtu.be":
+        vid = re.search(r"/([A-Za-z0-9_-]{11})(?:[?&#/]|$)", rest)
+        return vid.group(1) if vid else None
+    if host in _YOUTUBE_HOSTS:
+        vid = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", rest)
+        if vid:
+            return vid.group(1)
+        vid = re.search(r"/(?:shorts|live|embed|v)/([A-Za-z0-9_-]{11})", rest)
+        return vid.group(1) if vid else None
+    return None
+
+
+def _fetch_youtube_title(video_id: str) -> tuple[str | None, str | None, str | None]:
+    """Fetch a video's title + channel via YouTube's keyless oEmbed endpoint.
+
+    Returns (title, channel, error). error is None on success. A video that
+    oEmbed won't serve (private / deleted / age-restricted) returns a human-
+    readable reason instead of raising — one bad link must not sink the batch.
+    """
+    oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode(
+        {"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"}
+    )
+    req = urllib.request.Request(
+        oembed_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=YOUTUBE_REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        title = data.get("title")
+        if not (isinstance(title, str) and title):
+            return None, None, "no title returned for this video"
+        return title, data.get("author_name"), None
+    except urllib.error.HTTPError as exc:
+        # 400/401/403/404 from oEmbed = private, deleted, or restricted video.
+        # 429 = YouTube asked us to slow down (caller backs off, tries later).
+        if exc.code in (400, 401, 403, 404):
+            return None, None, "unavailable (private, deleted, or restricted video)"
+        if exc.code == 429:
+            return None, None, "YouTube asked us to slow down — try again in a minute"
+        return None, None, f"YouTube returned HTTP {exc.code}"
+    except Exception:
+        return None, None, "network error reaching YouTube"
+
+
+def _fetch_youtube_description(video_id: str) -> str | None:
+    """DORMANT unless YOUTUBE_API_KEY is set: fetch a short description preview
+    via the YouTube Data API (1 quota unit per call). Returns None with no key
+    or on any failure — title-only output stays valid either way. The key is
+    intentionally NOT configured today; this path activates automatically the
+    moment it appears in the environment (HF secret or local .env).
+    """
+    api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = ("https://www.googleapis.com/youtube/v3/videos?part=snippet&"
+           + urllib.parse.urlencode({"id": video_id, "key": api_key}))
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=YOUTUBE_REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("items") or []
+        if not items:
+            return None
+        raw = items[0].get("snippet", {}).get("description") or ""
+        preview = re.sub(r"\s+", " ", raw).strip()
+        if len(preview) > YOUTUBE_DESC_PREVIEW:
+            preview = preview[:YOUTUBE_DESC_PREVIEW].rsplit(" ", 1)[0] + "…"
+        return preview or None
+    except Exception:
+        return None  # description is a bonus — never fail the title over it
+
+
+_YOUTUBE_TOKEN_RE = re.compile(
+    r"(?<![\w.\-/])(?:https?://)?(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)/[^\s,;<>\"']+",
+    re.IGNORECASE,
+)
+
+
+def _extract_youtube_ids_from_text(text: str) -> list[str]:
+    """Pull every unique YouTube video ID out of free text, in order of appearance."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for token in _YOUTUBE_TOKEN_RE.findall(text or ""):
+        vid = _extract_youtube_video_id(token)
+        if vid and vid not in seen:
+            seen.add(vid)
+            ids.append(vid)
+    return ids
+
+
+def _fetch_missing_titles(misses: list[str], deadline: float) -> tuple[dict[str, dict], int, bool, int]:
+    """Fetch uncached video titles from YouTube — capped, paced, budget-bound.
+
+    Shared by get_youtube_titles and find_video_drops. A 429 (slow down) stops
+    the batch early. Successful fetches are cached in Firestore (description
+    preview too, when the dormant key path is active); failures are NOT cached —
+    an unavailable video may return later.
+
+    Returns (results, fetched_count, throttled, pending_count) where results
+    maps vid -> {title, channel, desc, status, error?} and status is one of:
+    'fetched' | 'unavailable' | 'throttled' | 'pending' (not attempted this call).
+    """
+    results: dict[str, dict] = {}
+    fetched = 0
+    throttled = False
+    for i, vid in enumerate(misses):
+        if throttled or fetched >= YOUTUBE_FETCH_CAP or time.monotonic() >= deadline:
+            for rest_vid in misses[i:]:
+                results[rest_vid] = {
+                    "title": None, "channel": None, "desc": None, "status": "pending",
+                }
+            break
+        if fetched > 0:
+            time.sleep(YOUTUBE_FETCH_DELAY)
+        title, channel, error = _fetch_youtube_title(vid)
+        fetched += 1
+        if title is None:
+            if error and "slow down" in error:
+                throttled = True
+            results[vid] = {
+                "title": None, "channel": None, "desc": None,
+                "status": "throttled" if throttled else "unavailable",
+                "error": error,
+            }
+            continue
+        # Dormant unless YOUTUBE_API_KEY is set — None today, zero cost.
+        desc = _fetch_youtube_description(vid)
+        results[vid] = {"title": title, "channel": channel, "desc": desc, "status": "fetched"}
+        try:
+            cache_doc = {
+                "videoId": vid,
+                "title": title,
+                "author_name": channel if isinstance(channel, str) else None,
+                "fetchedAt": firestore.SERVER_TIMESTAMP,
+            }
+            if desc:
+                cache_doc["descriptionPreview"] = desc
+            db.collection(YOUTUBE_CACHE_COLLECTION).document(vid).set(cache_doc)
+        except Exception:
+            pass  # best-effort — the answer still returns, just isn't remembered
+    pending = sum(1 for r in results.values() if r["status"] == "pending")
+    return results, fetched, throttled, pending
 
 
 # ── Tools ───────────────────────────────────────────────────────
@@ -1132,6 +1318,233 @@ def get_storage_stats() -> str:
         f"Total size: {total_size / (1024*1024):.2f} MB\n"
         f"Breakdown:\n" + "\n".join(breakdown_lines) + "\n"
     )
+
+
+@mcp.tool()
+def get_youtube_titles(urls: str) -> str:
+    """Get the real titles and channel names of YouTube videos from links.
+    Accepts any mix of YouTube URLs (watch, youtu.be, shorts, live, embed) or
+    bare video IDs, separated by spaces, commas, or newlines.
+    Titles are cached per video: known titles return instantly with zero
+    requests to YouTube; only never-seen videos are fetched (max 15 per call,
+    gently paced). If some videos were not fetched yet, call this tool again
+    with the SAME links — already-fetched ones return from the cache instantly.
+    Use this whenever a YouTube link matters. NEVER guess a video's title.
+    """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
+    raw_items = [s for s in re.split(r"[\s,]+", (urls or "").strip()) if s]
+    if not raw_items:
+        return "No links provided. Pass one or more YouTube links (space, comma, or newline separated)."
+    over_limit = len(raw_items) - YOUTUBE_INPUT_LIMIT
+    if over_limit > 0:
+        raw_items = raw_items[:YOUTUBE_INPUT_LIMIT]
+
+    # Parse + dedupe in input order; non-YouTube entries are reported, not guessed.
+    ordered: list[str] = []
+    seen: set[str] = set()
+    not_youtube: list[str] = []
+    for item in raw_items:
+        vid = _extract_youtube_video_id(item)
+        if vid is None:
+            not_youtube.append(item)
+            continue
+        if vid not in seen:
+            seen.add(vid)
+            ordered.append(vid)
+
+    if not ordered:
+        shown = ", ".join(not_youtube[:10]) + ("…" if len(not_youtube) > 10 else "")
+        return f"No YouTube links found in the input. Skipped: {shown}"
+
+    deadline = time.monotonic() + YOUTUBE_TIME_BUDGET
+
+    # 1. Cache first — a remembered title costs zero YouTube requests. The cache
+    #    is shared across chats and users (keyed by video, not by drop), so a
+    #    video is fetched from YouTube at most once, ever.
+    results: dict[str, dict] = {}  # vid -> {title, channel, desc, error, cached}
+    misses: list[str] = []
+    for vid in ordered:
+        try:
+            doc = db.collection(YOUTUBE_CACHE_COLLECTION).document(vid).get(
+                timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS
+            )
+        except Exception:
+            doc = None
+        d = (doc.to_dict() or {}) if (doc is not None and doc.exists) else {}
+        if isinstance(d.get("title"), str) and d.get("title"):
+            results[vid] = {
+                "title": d["title"],
+                "channel": d.get("author_name"),
+                "desc": d.get("descriptionPreview"),
+                "status": "memory",
+            }
+        else:
+            misses.append(vid)
+
+    # 2. Fetch only the misses — capped per call, paced, and budget-bound (the
+    #    pacing/caching rules live in _fetch_missing_titles, shared with
+    #    find_video_drops). Unfetched misses come back 'pending' so the model
+    #    can simply call again with the same links.
+    fetch_results, fetched, throttled, unattempted = _fetch_missing_titles(misses, deadline)
+    results.update(fetch_results)
+
+    # 3. Compose output — the tool computes the counts itself (models miscount
+    #    long lists; never let the LLM count lines).
+    ok = [vid for vid in ordered if results.get(vid, {}).get("title")]
+    from_cache = sum(1 for vid in ok if results[vid]["status"] == "memory")
+    lines = [
+        f"Resolved {len(ok)} of {len(ordered)} YouTube links "
+        f"({from_cache} from memory, {len(ok) - from_cache} fetched fresh):"
+    ]
+    for vid in ordered:
+        r = results.get(vid)
+        if r is None:
+            continue
+        if r["title"]:
+            by = f" — by {r['channel']}" if r["channel"] else ""
+            note = " (from memory)" if r["status"] == "memory" else ""
+            lines.append(f"- \"{r['title']}\"{by} (id={vid}){note}")
+            if r["desc"]:
+                lines.append(f"  Description preview: {r['desc']}")
+        else:
+            lines.append(f"- {vid}: {r.get('error') or r['status']}")
+    if not_youtube:
+        shown = ", ".join(not_youtube[:10]) + ("…" if len(not_youtube) > 10 else "")
+        lines.append(f"Skipped (not YouTube links): {shown}")
+    if over_limit > 0:
+        lines.append(f"Input truncated to the first {YOUTUBE_INPUT_LIMIT} links ({over_limit} more ignored).")
+    if throttled:
+        lines.append("YouTube asked us to slow down — wait a minute, then call again with the same links.")
+    elif unattempted:
+        lines.append(
+            f"{unattempted} new video(s) not fetched yet (per-call limit) — "
+            "call get_youtube_titles again with the same links; remembered ones return instantly."
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_video_drops() -> str:
+    """Find every accessible drop that contains a YouTube link, with each video's
+    REAL title and which drop/workspace it lives in — the complete list in one call.
+    Use this whenever the user asks about, describes, or wants to find a saved
+    video (by exact title OR by concept): read the returned titles and match the
+    user's words yourself. Titles are remembered per video, so repeat calls are
+    instant. If some titles are listed as pending, call this tool again to fetch
+    the rest. NEVER guess a video's title, and NEVER claim a video isn't saved
+    without checking this list first.
+    """
+    user_id = _verified_uid()
+    if not user_id:
+        return _UID_DENIED
+
+    deadline = time.monotonic() + SEARCH_TIME_BUDGET_SECONDS
+    now = datetime.now(timezone.utc)
+    decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
+    workspace_name_cache: dict[str, str] = {}
+
+    # Personal drops + member workspaces ONLY — same access scope as search_drops
+    # (_get_all_accessible_drops checks the members list of each workspace).
+    documents, incomplete = _get_all_accessible_drops(user_id, deadline)
+
+    video_ids: list[str] = []
+    seen_ids: set[str] = set()
+    drop_entries: list[tuple[str, dict, list[str]]] = []
+    drops_scanned = 0
+    for doc in documents:
+        if time.monotonic() >= deadline:
+            incomplete = True
+            break
+        d = doc.to_dict()
+        drops_scanned += 1
+        # Password drops are never decrypted; expired drops are gone.
+        if _is_password_drop(d) or _is_expired_drop(d, now):
+            continue
+        text = ""
+        if d.get("type") == "text" and d.get("content"):
+            decryption_cache.firestore_timeout = _get_search_timeout(deadline)
+            if decryption_cache.firestore_timeout is None:
+                incomplete = True
+                break
+            decrypted = decrypt_drop_content(user_id, d, cache=decryption_cache)
+            if decrypted:
+                text = decrypted
+        combined = " ".join(x for x in [(d.get("name") or ""), text] if x)
+        ids_in_drop: list[str] = []
+        for vid in _extract_youtube_ids_from_text(combined):
+            if vid not in ids_in_drop:
+                ids_in_drop.append(vid)
+            if vid not in seen_ids:
+                seen_ids.add(vid)
+                video_ids.append(vid)
+        if ids_in_drop:
+            drop_entries.append((doc.id, d, ids_in_drop))
+
+    if not drop_entries:
+        note = " (scan hit the time limit — try again)" if incomplete else ""
+        return f"None of the {drops_scanned} drops scanned contain YouTube links.{note}"
+
+    # Resolve titles: drawer first (instant), then capped fresh fetches.
+    title_map: dict[str, dict] = {}
+    misses: list[str] = []
+    for vid in video_ids:
+        if time.monotonic() >= deadline:
+            incomplete = True
+            break
+        try:
+            cdoc = db.collection(YOUTUBE_CACHE_COLLECTION).document(vid).get(timeout=2.0)
+        except Exception:
+            cdoc = None
+        cd = (cdoc.to_dict() or {}) if (cdoc is not None and cdoc.exists) else {}
+        if isinstance(cd.get("title"), str) and cd.get("title"):
+            title_map[vid] = {
+                "title": cd["title"], "channel": cd.get("author_name"),
+                "desc": cd.get("descriptionPreview"), "status": "memory",
+            }
+        else:
+            misses.append(vid)
+
+    fetch_results, _fetched, throttled, _pending = _fetch_missing_titles(misses, deadline)
+    title_map.update(fetch_results)
+
+    # Compose — computed counts first (never let the LLM count lines), then one
+    # line per video pointing at the drop it lives in.
+    from_cache = sum(1 for r in title_map.values() if r.get("status") == "memory" and r.get("title"))
+    fresh = sum(1 for r in title_map.values() if r.get("status") == "fetched")
+    lines = [
+        f"Found {len(video_ids)} YouTube video(s) across {len(drop_entries)} drop(s) "
+        f"— titles: {from_cache + fresh} known ({from_cache} from memory, {fresh} fetched fresh):"
+    ]
+    for doc_id, d, ids in drop_entries:
+        ws_id = d.get("workspaceId")
+        where = _get_workspace_name(ws_id, workspace_name_cache) if ws_id else "Personal"
+        for vid in ids:
+            r = title_map.get(vid) or {"status": "pending"}
+            drop_label = f"drop \"{d.get('name', 'untitled')}\" ({where}, drop_id={doc_id})"
+            if r.get("title"):
+                by = f" — by {r['channel']}" if r.get("channel") else ""
+                note = " (from memory)" if r.get("status") == "memory" else ""
+                lines.append(f"- \"{r['title']}\"{by} → {drop_label}{note}")
+            elif r.get("status") == "pending":
+                lines.append(f"- [title not fetched yet] video {vid} → {drop_label}")
+            else:
+                reason = r.get("error") or r.get("status") or "unavailable"
+                lines.append(f"- [title unavailable: {reason}] video {vid} → {drop_label}")
+
+    pending_total = sum(1 for vid in video_ids if (title_map.get(vid) or {}).get("status") == "pending")
+    if incomplete:
+        lines.append("Note: the drop scan hit the time limit — some drops were not scanned; call again.")
+    if throttled:
+        lines.append("YouTube asked us to slow down — wait a minute, then call again to fetch remaining titles.")
+    elif pending_total:
+        lines.append(
+            f"{pending_total} title(s) still pending (per-call fetch limit) — "
+            "call find_video_drops again to fetch them."
+        )
+    return "\n".join(lines)
 
 
 @mcp.tool()
