@@ -566,7 +566,7 @@ def _extract_youtube_ids_from_text(text: str) -> list[str]:
     return ids
 
 
-def _fetch_missing_titles(misses: list[str], deadline: float) -> tuple[dict[str, dict], int, bool, int]:
+def _fetch_missing_titles(misses: list[str], deadline: float, cap: int = YOUTUBE_FETCH_CAP) -> tuple[dict[str, dict], int, bool, int]:
     """Fetch uncached video titles from YouTube — capped, paced, budget-bound.
 
     Shared by get_youtube_titles and find_video_drops. A 429 (slow down) stops
@@ -582,7 +582,7 @@ def _fetch_missing_titles(misses: list[str], deadline: float) -> tuple[dict[str,
     fetched = 0
     throttled = False
     for i, vid in enumerate(misses):
-        if throttled or fetched >= YOUTUBE_FETCH_CAP or time.monotonic() >= deadline:
+        if throttled or fetched >= cap or time.monotonic() >= deadline:
             for rest_vid in misses[i:]:
                 results[rest_vid] = {
                     "title": None, "channel": None, "desc": None, "status": "pending",
@@ -769,7 +769,12 @@ def search_drops(query: str) -> str:
     if not scored_results:
         if incomplete:
             return f"Search incomplete for '{query}'. Try a narrower query."
-        return f"No drops matching '{query}'. Try listing your drops to see what's available."
+        return (
+            f"No drops matching '{query}'. Try listing your drops to see what's available. "
+            "NOTE: this searches drop text only — if the user is looking for a VIDEO or SONG "
+            "by its title/name/description, call find_video_drops instead (it matches real "
+            "YouTube titles, which are not part of the drop text)."
+        )
 
     # Sort by score descending, return top 10
     scored_results.sort(key=lambda x: -x[0])
@@ -1448,15 +1453,18 @@ def find_video_drops() -> str:
     Use this whenever the user asks about, describes, or wants to find a saved
     video (by exact title OR by concept): read the returned titles and match the
     user's words yourself. Titles are remembered per video, so repeat calls are
-    instant. If some titles are listed as pending, call this tool again to fetch
-    the rest. NEVER guess a video's title, and NEVER claim a video isn't saved
-    without checking this list first.
+    instant. If the output says titles are pending, the list is INCOMPLETE — call
+    this tool again before answering (repeat until nothing is pending). NEVER
+    guess a video's title, NEVER claim a video isn't saved without checking this
+    COMPLETE list first, and NEVER substitute a single-link get_youtube_titles
+    lookup when the user is asking WHICH of their drops has a video.
     """
     user_id = _verified_uid()
     if not user_id:
         return _UID_DENIED
 
-    deadline = time.monotonic() + SEARCH_TIME_BUDGET_SECONDS
+    start = time.monotonic()
+    deadline = start + SEARCH_TIME_BUDGET_SECONDS  # drop-scan phase budget
     now = datetime.now(timezone.utc)
     decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
     workspace_name_cache: dict[str, str] = {}
@@ -1522,17 +1530,35 @@ def find_video_drops() -> str:
         else:
             misses.append(vid)
 
-    fetch_results, _fetched, throttled, _pending = _fetch_missing_titles(misses, deadline)
+    # Fetch phase gets its OWN budget (the whole call must stay under the MCP
+    # layer's 60s kill switch, hence the start+52 clamp) and a higher cap than
+    # single-link lookups — the goal is a complete list in as few calls as possible.
+    fetch_deadline = min(time.monotonic() + YOUTUBE_TIME_BUDGET, start + 52.0)
+    fetch_results, _fetched, throttled, _pending = _fetch_missing_titles(
+        misses, fetch_deadline, cap=25
+    )
     title_map.update(fetch_results)
 
     # Compose — computed counts first (never let the LLM count lines), then one
     # line per video pointing at the drop it lives in.
     from_cache = sum(1 for r in title_map.values() if r.get("status") == "memory" and r.get("title"))
     fresh = sum(1 for r in title_map.values() if r.get("status") == "fetched")
-    lines = [
+    pending_total = sum(1 for vid in video_ids if (title_map.get(vid) or {}).get("status") == "pending")
+    lines = []
+    if pending_total:
+        # FIRST line on purpose — the model must not answer from a partial list
+        # (live failure mode: it matched a partial list and gave a wrong drop).
+        lines.append(
+            f"INCOMPLETE LIST — {pending_total} title(s) not fetched yet (per-call limit). "
+            "You MUST call find_video_drops again before answering; already-fetched titles "
+            "return instantly from memory. Do NOT match or rule out any video whose title "
+            "you don't have yet."
+        )
+    lines.append(
         f"Found {len(video_ids)} YouTube video(s) across {len(drop_entries)} drop(s) "
-        f"— titles: {from_cache + fresh} known ({from_cache} from memory, {fresh} fetched fresh):"
-    ]
+        f"— titles: {from_cache + fresh} known ({from_cache} from memory, {fresh} fetched "
+        f"fresh, {pending_total} pending):"
+    )
     for doc_id, d, ids in drop_entries:
         ws_id = d.get("workspaceId")
         where = _get_workspace_name(ws_id, workspace_name_cache) if ws_id else "Personal"
@@ -1549,7 +1575,6 @@ def find_video_drops() -> str:
                 reason = r.get("error") or r.get("status") or "unavailable"
                 lines.append(f"- [title unavailable: {reason}] video {vid} → {drop_label}")
 
-    pending_total = sum(1 for vid in video_ids if (title_map.get(vid) or {}).get("status") == "pending")
     if incomplete:
         lines.append("Note: the drop scan hit the time limit — some drops were not scanned; call again.")
     if throttled:
