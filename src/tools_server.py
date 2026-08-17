@@ -10,9 +10,9 @@ import sys
 import os
 import logging
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+import requests
 
 # Ensure this script's directory is on sys.path so imports work
 # regardless of the working directory of the parent process
@@ -470,6 +470,32 @@ def _extract_youtube_video_id(text: str) -> str | None:
     return None
 
 
+def _http_get_json(url: str) -> tuple[dict | None, int | None, str | None]:
+    """GET a JSON document via requests, with one retry. Returns (json, status, error).
+
+    Uses the requests stack (certifi CA bundle), NOT stdlib urllib: inside the
+    HF Space container stdlib HTTPS to YouTube failed while every requests-based
+    call (Firebase, LLM provider) kept working. On failure the error is the
+    exception CLASS name only — never str(exc), which would embed the URL and
+    any credentials it carries.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"}
+    last_error = "network error reaching YouTube"
+    for attempt in (1, 2):  # one retry absorbs transient connection resets
+        try:
+            resp = requests.get(url, timeout=YOUTUBE_REQUEST_TIMEOUT, headers=headers)
+            try:
+                return resp.json(), resp.status_code, None
+            except ValueError:
+                return None, resp.status_code, "unexpected response from YouTube"
+        except requests.exceptions.RequestException as exc:
+            last_error = f"network error reaching YouTube ({type(exc).__name__})"
+            logger.warning("YouTube request failed (attempt %d): %s", attempt, type(exc).__name__)
+            if attempt == 1:
+                time.sleep(1.0)
+    return None, None, last_error
+
+
 def _fetch_youtube_title(video_id: str) -> tuple[str | None, str | None, str | None]:
     """Fetch a video's title + channel via YouTube's keyless oEmbed endpoint.
 
@@ -480,27 +506,21 @@ def _fetch_youtube_title(video_id: str) -> tuple[str | None, str | None, str | N
     oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode(
         {"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"}
     )
-    req = urllib.request.Request(
-        oembed_url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=YOUTUBE_REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        title = data.get("title")
-        if not (isinstance(title, str) and title):
-            return None, None, "no title returned for this video"
-        return title, data.get("author_name"), None
-    except urllib.error.HTTPError as exc:
+    data, status, error = _http_get_json(oembed_url)
+    if data is None:
         # 400/401/403/404 from oEmbed = private, deleted, or restricted video.
         # 429 = YouTube asked us to slow down (caller backs off, tries later).
-        if exc.code in (400, 401, 403, 404):
+        if status in (400, 401, 403, 404):
             return None, None, "unavailable (private, deleted, or restricted video)"
-        if exc.code == 429:
+        if status == 429:
             return None, None, "YouTube asked us to slow down — try again in a minute"
-        return None, None, f"YouTube returned HTTP {exc.code}"
-    except Exception:
-        return None, None, "network error reaching YouTube"
+        if status is not None:
+            return None, None, f"YouTube returned HTTP {status}"
+        return None, None, error or "network error reaching YouTube"
+    title = data.get("title")
+    if not (isinstance(title, str) and title):
+        return None, None, "no title returned for this video"
+    return title, data.get("author_name"), None
 
 
 def _fetch_youtube_description(video_id: str) -> str | None:
@@ -515,22 +535,17 @@ def _fetch_youtube_description(video_id: str) -> str | None:
         return None
     url = ("https://www.googleapis.com/youtube/v3/videos?part=snippet&"
            + urllib.parse.urlencode({"id": video_id, "key": api_key}))
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=YOUTUBE_REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        items = data.get("items") or []
-        if not items:
-            return None
-        raw = items[0].get("snippet", {}).get("description") or ""
-        preview = re.sub(r"\s+", " ", raw).strip()
-        if len(preview) > YOUTUBE_DESC_PREVIEW:
-            preview = preview[:YOUTUBE_DESC_PREVIEW].rsplit(" ", 1)[0] + "…"
-        return preview or None
-    except Exception:
-        return None  # description is a bonus — never fail the title over it
+    data, _status, _error = _http_get_json(url)
+    if not data:
+        return None
+    items = data.get("items") or []
+    if not items:
+        return None
+    raw = items[0].get("snippet", {}).get("description") or ""
+    preview = re.sub(r"\s+", " ", raw).strip()
+    if len(preview) > YOUTUBE_DESC_PREVIEW:
+        preview = preview[:YOUTUBE_DESC_PREVIEW].rsplit(" ", 1)[0] + "…"
+    return preview or None
 
 
 _YOUTUBE_TOKEN_RE = re.compile(
