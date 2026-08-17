@@ -447,6 +447,7 @@ def list_drops(workspace_id: str | None = None) -> str:
     decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
     workspace_name_cache: dict[str, str] = {}
     drops = []
+    file_count = 0
     for doc in docs:
         d = doc.to_dict()
 
@@ -455,6 +456,9 @@ def list_drops(workspace_id: str | None = None) -> str:
             continue
         if _is_expired_drop(d, now):
             continue
+
+        if d.get("type") == "file":
+            file_count += 1
 
         # Decrypt content for preview
         content_preview = ""
@@ -475,7 +479,25 @@ def list_drops(workspace_id: str | None = None) -> str:
 
     if not drops:
         return "No drops found."
-    return "\n".join(drops)
+
+    # Count header FIRST: models miscount 50+ line lists (wrong drop counts on
+    # big workspaces) — with the total up top the model reads it instead of
+    # counting lines itself. The exclusion note explains any gap vs the app UI.
+    text_count = len(drops) - file_count
+    if workspace_id and workspace_id.lower() != "none":
+        ws_name = _get_workspace_name(workspace_id, workspace_name_cache)
+        header = (
+            f"{len(drops)} drops in workspace \"{ws_name}\" "
+            f"({text_count} text, {file_count} file; "
+            f"password and expired drops not included):"
+        )
+    else:
+        header = (
+            f"{len(drops)} personal drops "
+            f"({text_count} text, {file_count} file; "
+            f"password and expired drops not included):"
+        )
+    return header + "\n" + "\n".join(drops)
 
 
 @mcp.tool()
