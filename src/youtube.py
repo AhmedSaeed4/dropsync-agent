@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 YOUTUBE_CACHE_COLLECTION = "youtubeTitles"
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 YOUTUBE_REQUEST_TIMEOUT = 8.0
+# The resolve endpoint must answer well inside the frontend's request timeout:
+# a hanging YouTube is reported as 'temporary' after ONE short attempt instead
+# of being retried past the caller's patience. get_youtube_titles (chat) keeps
+# the patient 8s x2 defaults — it has no client-side cutoff.
+YOUTUBE_RESOLVE_ATTEMPT_TIMEOUT = 4.0
 YOUTUBE_FETCH_DELAY = 0.4
 YOUTUBE_RESOLVE_MAX_IDS = 10
 YOUTUBE_RESOLVE_FRESH_CAP = 5
@@ -43,7 +48,12 @@ def normalize_video_ids(video_ids: list[Any]) -> list[str]:
     return result
 
 
-def _http_get_json(url: str) -> tuple[dict | None, int | None, str | None]:
+def _http_get_json(
+    url: str,
+    *,
+    timeout: float = YOUTUBE_REQUEST_TIMEOUT,
+    retry_on_timeout: bool = True,
+) -> tuple[dict | None, int | None, str | None]:
     """Fetch JSON with requests; never use stdlib HTTPS in the HF container."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; DropSync-Assistant/1.0)"}
     last_error = "network error reaching YouTube"
@@ -51,7 +61,7 @@ def _http_get_json(url: str) -> tuple[dict | None, int | None, str | None]:
         try:
             response = requests.get(
                 url,
-                timeout=YOUTUBE_REQUEST_TIMEOUT,
+                timeout=timeout,
                 headers=headers,
             )
             try:
@@ -66,11 +76,20 @@ def _http_get_json(url: str) -> tuple[dict | None, int | None, str | None]:
                 type(exc).__name__,
             )
             if attempt == 1:
+                if isinstance(exc, requests.exceptions.Timeout) and not retry_on_timeout:
+                    # Caller opted out of retrying hangs: fail fast so the
+                    # resolve endpoint answers within its time budget.
+                    return None, None, last_error
                 time.sleep(1.0)
     return None, None, last_error
 
 
-def fetch_youtube_title(video_id: str) -> tuple[str | None, str | None, str | None, int | None]:
+def fetch_youtube_title(
+    video_id: str,
+    *,
+    attempt_timeout: float = YOUTUBE_REQUEST_TIMEOUT,
+    retry_on_timeout: bool = True,
+) -> tuple[str | None, str | None, str | None, int | None]:
     """Fetch title/channel for one already-validated ID from the fixed oEmbed URL."""
     if not YOUTUBE_ID_RE.fullmatch(video_id):
         return None, None, "invalid video id", None
@@ -81,7 +100,9 @@ def fetch_youtube_title(video_id: str) -> tuple[str | None, str | None, str | No
         "https://www.youtube.com/oembed?"
         f"url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D{video_id}&format=json"
     )
-    data, status, error = _http_get_json(oembed_url)
+    data, status, error = _http_get_json(
+        oembed_url, timeout=attempt_timeout, retry_on_timeout=retry_on_timeout
+    )
     if status in (400, 401, 403, 404):
         return None, None, "unavailable", status
     if status == 429:
@@ -188,7 +209,11 @@ def resolve_video_ids(
         if fetched > 0:
             time.sleep(YOUTUBE_FETCH_DELAY)
 
-        title, channel, error, _status = fetch_youtube_title(video_id)
+        title, channel, error, _status = fetch_youtube_title(
+            video_id,
+            attempt_timeout=YOUTUBE_RESOLVE_ATTEMPT_TIMEOUT,
+            retry_on_timeout=False,
+        )
         fetched += 1
         if title is None:
             reason = error or "temporary"

@@ -58,6 +58,20 @@ class YouTubeResolverTests(unittest.TestCase):
         self.assertTrue(requested_url.startswith("https://www.youtube.com/oembed?"))
         self.assertIn("v%3Dabc12345678", requested_url)
 
+    @patch.object(youtube.requests, "get")
+    @patch.object(youtube, "_read_cached_title", return_value=None)
+    @patch.object(youtube, "_merge_cached_title")
+    def test_resolve_fails_fast_on_hanging_youtube(self, merge_mock, cache_mock, get_mock):
+        get_mock.side_effect = youtube.requests.exceptions.ReadTimeout("hang")
+
+        result = youtube.resolve_video_ids(["abc12345678"])
+
+        # ONE short attempt, no retry: the resolve endpoint must answer well
+        # inside the frontend's request timeout even when YouTube hangs.
+        self.assertEqual(get_mock.call_count, 1)
+        self.assertTrue(result["unresolved"][0]["reason"].startswith("network error"))
+        merge_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
