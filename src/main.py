@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from agents import (
     Runner,
@@ -33,6 +33,7 @@ from firebase_admin import auth as firebase_auth
 from config import run_config, MODEL_NAME, db
 from agent import dropsync_agent, knowledge_agent
 from usage_limit import admit_or_raise
+from youtube import YOUTUBE_ID_RE, YOUTUBE_RESOLVE_MAX_IDS, normalize_video_ids, resolve_video_ids
 
 import openai
 
@@ -269,6 +270,42 @@ class RunCancelResponse(BaseModel):
     # cancel returns no summary, so exactly one client can ever receive it and there
     # is exactly one writer of the saved stop turn. Additive: old clients ignore it.
     summary: str | None = None
+
+
+class YouTubeResolveRequest(BaseModel):
+    videoIds: list[str]
+
+
+# The resolver is deliberately rate-limited in memory.  It is pruned only when
+# this explicit endpoint is called; there is no timer, worker, or Firestore quota
+# counter consuming the shared project quota.
+_YOUTUBE_REQUESTS_PER_MINUTE = 12
+_YOUTUBE_REQUEST_WINDOW_SECONDS = 60.0
+_youtube_request_times: dict[str, list[float]] = {}
+
+
+def _admit_youtube_resolve(user_id: str) -> None:
+    now = time.monotonic()
+    # Bound the in-memory map without a cleanup task.  Only this explicit
+    # request path performs pruning.
+    for known_uid, timestamps in list(_youtube_request_times.items()):
+        if not any(now - timestamp < _YOUTUBE_REQUEST_WINDOW_SECONDS for timestamp in timestamps):
+            _youtube_request_times.pop(known_uid, None)
+    recent = [
+        timestamp
+        for timestamp in _youtube_request_times.get(user_id, [])
+        if now - timestamp < _YOUTUBE_REQUEST_WINDOW_SECONDS
+    ]
+    if len(recent) >= _YOUTUBE_REQUESTS_PER_MINUTE:
+        retry_after = max(1, int(_YOUTUBE_REQUEST_WINDOW_SECONDS - (now - recent[0])))
+        _youtube_request_times[user_id] = recent
+        raise HTTPException(
+            status_code=429,
+            detail="YouTube label lookups are temporarily paced. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    recent.append(now)
+    _youtube_request_times[user_id] = recent
 
 
 # ── Resumable run registry ──────────────────────────────────────
@@ -898,6 +935,42 @@ async def _follow_run(run: _ChatRun):
 
 
 # ── Endpoints ───────────────────────────────────────────────────
+
+@app.post("/youtube/resolve-labels")
+def resolve_youtube_labels(
+    req: YouTubeResolveRequest,
+    user_id: str = Depends(verify_user),
+):
+    """Resolve a small, authenticated batch of YouTube video IDs.
+
+    This endpoint deliberately receives no drop ID or drop content and never
+    writes a drop document.  The browser applies the returned labels through
+    the existing Firestore rules.  Only the backend-only youtubeTitles drawer
+    is used as a cache.
+    """
+    if len(req.videoIds) > YOUTUBE_RESOLVE_MAX_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {YOUTUBE_RESOLVE_MAX_IDS} video IDs may be sent at once.",
+        )
+
+    if any(not isinstance(video_id, str) or not YOUTUBE_ID_RE.fullmatch(video_id.strip()) for video_id in req.videoIds):
+        raise HTTPException(status_code=400, detail="videoIds must contain valid YouTube IDs")
+
+    normalized = normalize_video_ids(req.videoIds)
+    if not normalized:
+        return {"labels": [], "unresolved": [], "retryAfterSeconds": None}
+
+    _admit_youtube_resolve(user_id)
+    result = resolve_video_ids(normalized)
+    headers = {}
+    if result.get("retryAfterSeconds"):
+        headers["Retry-After"] = str(result["retryAfterSeconds"])
+    # A partial response stays JSON-readable by the browser, even when one oEmbed
+    # request returned 429.  The individual reason and Retry-After tell it to
+    # defer that ID instead of retrying immediately.
+    return JSONResponse(content=result, headers=headers)
+
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, user_id: str = Depends(verify_user)):
