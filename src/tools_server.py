@@ -240,9 +240,16 @@ def _verified_uid() -> str | None:
     return uid
 
 
-def _score_query(query: str, name: str, category: str, content: str) -> float:
+def _score_query(
+    query: str,
+    name: str,
+    category: str,
+    content: str,
+    youtube_labels: list[dict] | None = None,
+) -> float:
     """Score a drop against a multi-token query. Returns 0.0 for no match.
-    Higher score = better match. Name matches weigh most, then category, then content."""
+    Higher score = better match. Saved video titles match at roughly name weight,
+    channel is secondary, then category/content retain their existing behavior."""
     tokens = query.lower().split()
     if not tokens:
         return 0.0
@@ -271,6 +278,26 @@ def _score_query(query: str, name: str, category: str, content: str) -> float:
                 word_ratio = SequenceMatcher(None, token, nw).ratio()
                 if word_ratio >= 0.65:
                     token_score = max(token_score, word_ratio * 0.85)
+
+        # SAVED YOUTUBE TITLES: public labels are searchable metadata, but are
+        # only read by callers after password/expiry access checks.
+        for label in youtube_labels or []:
+            if not isinstance(label, dict):
+                continue
+            title = label.get("title") if isinstance(label.get("title"), str) else ""
+            channel = label.get("channel") if isinstance(label.get("channel"), str) else ""
+            title_lower = title.lower()
+            channel_lower = channel.lower()
+            if title_lower and token in title_lower:
+                token_score = max(token_score, 1.0)
+            elif title_lower:
+                title_ratio = SequenceMatcher(None, token, title_lower).ratio()
+                token_score = max(token_score, title_ratio * 0.9)
+            if channel_lower and token in channel_lower:
+                token_score = max(token_score, 0.8)
+            elif channel_lower:
+                channel_ratio = SequenceMatcher(None, token, channel_lower).ratio()
+                token_score = max(token_score, channel_ratio * 0.7)
 
         # CATEGORY: exact = 0.9, fuzzy = up to 0.8
         if cat_lower and token in cat_lower:
@@ -324,6 +351,7 @@ def _format_drop(
     content_preview: str = "",
     workspace_name_cache: dict[str, str] | None = None,
     timeout: float | None = None,
+    include_youtube_labels: bool = False,
 ) -> str:
     """Format a drop for display. Shows workspace name (ID) if not personal."""
     image_info = ""
@@ -338,13 +366,26 @@ def _format_drop(
     ws_name = _get_workspace_name(ws_id, workspace_name_cache, timeout) if ws_id else None
     ws_info = f"workspace={ws_name}({ws_id})" if ws_id else "workspace=Personal"
     categories = ", ".join(_normalize_categories(d)) or "none"
+    youtube_info = ""
+    if include_youtube_labels and d.get("type") == "text" and isinstance(d.get("youtubeVideoLabels"), list):
+        labels = []
+        for label in d["youtubeVideoLabels"]:
+            if not isinstance(label, dict) or not isinstance(label.get("title"), str):
+                continue
+            title = label["title"].strip()
+            if not title:
+                continue
+            channel = label.get("channel") if isinstance(label.get("channel"), str) else None
+            labels.append(f'"{title[:200]}"' + (f" by {channel[:120]}" if channel else ""))
+        if labels:
+            youtube_info = ", youtube=" + " | ".join(labels[:10])
     return (
         f"- {d.get('name', 'untitled')} "
         f"(type={d.get('type', '?')}, "
         f"encrypted={d.get('encrypted', False)}, "
         f"category={categories}, "
         f"expires={d.get('expiresAt', 'never')}"
-        f"{content_preview}{image_info}, "
+        f"{content_preview}{image_info}{youtube_info}, "
         f"workspace_id={ws_id or 'null'}, "
         f"{ws_info}, "
         f"id={doc_id})"
@@ -569,7 +610,7 @@ def _extract_youtube_ids_from_text(text: str) -> list[str]:
 def _fetch_missing_titles(misses: list[str], deadline: float, cap: int = YOUTUBE_FETCH_CAP) -> tuple[dict[str, dict], int, bool, int]:
     """Fetch uncached video titles from YouTube — capped, paced, budget-bound.
 
-    Shared by get_youtube_titles and find_video_drops. A 429 (slow down) stops
+    Used by get_youtube_titles. A 429 (slow down) stops
     the batch early. Successful fetches are cached in Firestore (description
     preview too, when the dormant key path is active); failures are NOT cached —
     an unavailable video may return later.
@@ -746,7 +787,8 @@ def search_drops(query: str) -> str:
             if decrypted:
                 decrypted_content = decrypted
 
-        score = _score_query(query_lower, name, category, decrypted_content)
+        youtube_labels = d.get("youtubeVideoLabels") if d.get("type") == "text" and isinstance(d.get("youtubeVideoLabels"), list) else []
+        score = _score_query(query_lower, name, category, decrypted_content, youtube_labels)
 
         # Minimum threshold: at least one token must match something
         if score > 0.05:
@@ -763,6 +805,7 @@ def search_drops(query: str) -> str:
                     content_preview,
                     workspace_name_cache,
                     timeout=format_timeout,
+                    include_youtube_labels=True,
                 ),
             ))
 
@@ -771,9 +814,7 @@ def search_drops(query: str) -> str:
             return f"Search incomplete for '{query}'. Try a narrower query."
         return (
             f"No drops matching '{query}'. Try listing your drops to see what's available. "
-            "NOTE: this searches drop text only — if the user is looking for a VIDEO or SONG "
-            "by its title/name/description, call find_video_drops instead (it matches real "
-            "YouTube titles, which are not part of the drop text)."
+            "Saved YouTube titles and channel names are included when a drop has been labeled."
         )
 
     # Sort by score descending, return top 10
@@ -1243,6 +1284,8 @@ def copy_drop(drop_id: str, target_workspace_id: str) -> str:
         "iv": encrypted["iv"],
         "encryptedDEK": None,
     }
+    if isinstance(d.get("youtubeVideoLabels"), list) and d.get("youtubeVideoLabels"):
+        new_doc["youtubeVideoLabels"] = d["youtubeVideoLabels"]
     if image_fields:
         new_doc.update(image_fields)
 
@@ -1406,8 +1449,8 @@ def get_youtube_titles(urls: str) -> str:
 
     # 2. Fetch only the misses — capped per call, paced, and budget-bound (the
     #    pacing/caching rules live in _fetch_missing_titles, shared with
-    #    find_video_drops). Unfetched misses come back 'pending' so the model
-    #    can simply call again with the same links.
+    #    endpoint). Unfetched misses come back 'pending' so a later explicit
+    #    lookup can retry the same links.
     fetch_results, fetched, throttled, unattempted = _fetch_missing_titles(misses, deadline)
     results.update(fetch_results)
 
@@ -1442,147 +1485,6 @@ def get_youtube_titles(urls: str) -> str:
         lines.append(
             f"{unattempted} new video(s) not fetched yet (per-call limit) — "
             "call get_youtube_titles again with the same links; remembered ones return instantly."
-        )
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def find_video_drops() -> str:
-    """Find every accessible drop that contains a YouTube link, with each video's
-    REAL title and which drop/workspace it lives in — the complete list in one call.
-    Use this whenever the user asks about, describes, or wants to find a saved
-    video (by exact title OR by concept): read the returned titles and match the
-    user's words yourself. Titles are remembered per video, so repeat calls are
-    instant. If the output says titles are pending, the list is INCOMPLETE — call
-    this tool again before answering (repeat until nothing is pending). NEVER
-    guess a video's title, NEVER claim a video isn't saved without checking this
-    COMPLETE list first, and NEVER substitute a single-link get_youtube_titles
-    lookup when the user is asking WHICH of their drops has a video.
-    """
-    user_id = _verified_uid()
-    if not user_id:
-        return _UID_DENIED
-
-    start = time.monotonic()
-    deadline = start + SEARCH_TIME_BUDGET_SECONDS  # drop-scan phase budget
-    now = datetime.now(timezone.utc)
-    decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
-    workspace_name_cache: dict[str, str] = {}
-
-    # Personal drops + member workspaces ONLY — same access scope as search_drops
-    # (_get_all_accessible_drops checks the members list of each workspace).
-    documents, incomplete = _get_all_accessible_drops(user_id, deadline)
-
-    video_ids: list[str] = []
-    seen_ids: set[str] = set()
-    drop_entries: list[tuple[str, dict, list[str]]] = []
-    drops_scanned = 0
-    for doc in documents:
-        if time.monotonic() >= deadline:
-            incomplete = True
-            break
-        d = doc.to_dict()
-        drops_scanned += 1
-        # Password drops are never decrypted; expired drops are gone.
-        if _is_password_drop(d) or _is_expired_drop(d, now):
-            continue
-        text = ""
-        if d.get("type") == "text" and d.get("content"):
-            decryption_cache.firestore_timeout = _get_search_timeout(deadline)
-            if decryption_cache.firestore_timeout is None:
-                incomplete = True
-                break
-            decrypted = decrypt_drop_content(user_id, d, cache=decryption_cache)
-            if decrypted:
-                text = decrypted
-        combined = " ".join(x for x in [(d.get("name") or ""), text] if x)
-        ids_in_drop: list[str] = []
-        for vid in _extract_youtube_ids_from_text(combined):
-            if vid not in ids_in_drop:
-                ids_in_drop.append(vid)
-            if vid not in seen_ids:
-                seen_ids.add(vid)
-                video_ids.append(vid)
-        if ids_in_drop:
-            drop_entries.append((doc.id, d, ids_in_drop))
-
-    if not drop_entries:
-        note = " (scan hit the time limit — try again)" if incomplete else ""
-        return f"None of the {drops_scanned} drops scanned contain YouTube links.{note}"
-
-    # Resolve titles: drawer first (instant), then capped fresh fetches.
-    title_map: dict[str, dict] = {}
-    misses: list[str] = []
-    for vid in video_ids:
-        if time.monotonic() >= deadline:
-            incomplete = True
-            break
-        try:
-            cdoc = db.collection(YOUTUBE_CACHE_COLLECTION).document(vid).get(timeout=2.0)
-        except Exception:
-            cdoc = None
-        cd = (cdoc.to_dict() or {}) if (cdoc is not None and cdoc.exists) else {}
-        if isinstance(cd.get("title"), str) and cd.get("title"):
-            title_map[vid] = {
-                "title": cd["title"], "channel": cd.get("author_name"),
-                "desc": cd.get("descriptionPreview"), "status": "memory",
-            }
-        else:
-            misses.append(vid)
-
-    # Fetch phase gets its OWN budget (the whole call must stay under the MCP
-    # layer's 60s kill switch, hence the start+52 clamp) and a higher cap than
-    # single-link lookups — the goal is a complete list in as few calls as possible.
-    fetch_deadline = min(time.monotonic() + YOUTUBE_TIME_BUDGET, start + 52.0)
-    fetch_results, _fetched, throttled, _pending = _fetch_missing_titles(
-        misses, fetch_deadline, cap=25
-    )
-    title_map.update(fetch_results)
-
-    # Compose — computed counts first (never let the LLM count lines), then one
-    # line per video pointing at the drop it lives in.
-    from_cache = sum(1 for r in title_map.values() if r.get("status") == "memory" and r.get("title"))
-    fresh = sum(1 for r in title_map.values() if r.get("status") == "fetched")
-    pending_total = sum(1 for vid in video_ids if (title_map.get(vid) or {}).get("status") == "pending")
-    lines = []
-    if pending_total:
-        # FIRST line on purpose — the model must not answer from a partial list
-        # (live failure mode: it matched a partial list and gave a wrong drop).
-        lines.append(
-            f"INCOMPLETE LIST — {pending_total} title(s) not fetched yet (per-call limit). "
-            "You MUST call find_video_drops again before answering; already-fetched titles "
-            "return instantly from memory. Do NOT match or rule out any video whose title "
-            "you don't have yet."
-        )
-    lines.append(
-        f"Found {len(video_ids)} YouTube video(s) across {len(drop_entries)} drop(s) "
-        f"— titles: {from_cache + fresh} known ({from_cache} from memory, {fresh} fetched "
-        f"fresh, {pending_total} pending):"
-    )
-    for doc_id, d, ids in drop_entries:
-        ws_id = d.get("workspaceId")
-        where = _get_workspace_name(ws_id, workspace_name_cache) if ws_id else "Personal"
-        for vid in ids:
-            r = title_map.get(vid) or {"status": "pending"}
-            drop_label = f"drop \"{d.get('name', 'untitled')}\" ({where}, drop_id={doc_id})"
-            if r.get("title"):
-                by = f" — by {r['channel']}" if r.get("channel") else ""
-                note = " (from memory)" if r.get("status") == "memory" else ""
-                lines.append(f"- \"{r['title']}\"{by} → {drop_label}{note}")
-            elif r.get("status") == "pending":
-                lines.append(f"- [title not fetched yet] video {vid} → {drop_label}")
-            else:
-                reason = r.get("error") or r.get("status") or "unavailable"
-                lines.append(f"- [title unavailable: {reason}] video {vid} → {drop_label}")
-
-    if incomplete:
-        lines.append("Note: the drop scan hit the time limit — some drops were not scanned; call again.")
-    if throttled:
-        lines.append("YouTube asked us to slow down — wait a minute, then call again to fetch remaining titles.")
-    elif pending_total:
-        lines.append(
-            f"{pending_total} title(s) still pending (per-call fetch limit) — "
-            "call find_video_drops again to fetch them."
         )
     return "\n".join(lines)
 
@@ -2102,6 +2004,14 @@ def update_drop(
             if not encrypted:
                 return "Failed to encrypt content. User encryption keys may not be set up."
             update_data.update(encrypted)
+
+    # Labels describe the current name/content.  The agent's Admin SDK update
+    # path must not leave a title attached to a video that was replaced.  The
+    # normal app path resolves the new labels; an agent edit can be recovered by
+    # the user's explicit backfill action.  This touches only the feature-owned
+    # field and never rewrites existing content or encryption fields.
+    if name is not None or content is not None:
+        update_data["youtubeVideoLabels"] = firestore.DELETE_FIELD
 
     # Nothing to update
     if not update_data:

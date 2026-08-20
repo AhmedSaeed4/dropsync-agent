@@ -279,5 +279,46 @@ class DecryptionCacheTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
 
+class YouTubeLabelSearchTests(unittest.TestCase):
+    def test_search_matches_saved_title_and_channel_without_decrypting_password_drop(self):
+        docs = [
+            FakeDoc(
+                "video-drop",
+                {
+                    "name": "Saved links",
+                    "type": "text",
+                    "youtubeVideoLabels": [
+                        {"videoId": "abc12345678", "title": "Loneliness in winter", "channel": "Quiet Channel"}
+                    ],
+                    "expiresAt": datetime.now(timezone.utc) + timedelta(hours=1),
+                },
+            ),
+            FakeDoc(
+                "password-video-drop",
+                {
+                    "name": "Private links",
+                    "type": "text",
+                    "categories": ["password"],
+                    "youtubeVideoLabels": [
+                        {"videoId": "xyz98765432", "title": "Loneliness private", "channel": "Private"}
+                    ],
+                    "expiresAt": datetime.now(timezone.utc) + timedelta(hours=1),
+                },
+            ),
+        ]
+
+        with (
+            patch.object(tools_server, "_verified_uid", return_value="user-1"),
+            patch.object(tools_server, "_get_all_accessible_drops", return_value=(docs, False)),
+            patch.object(tools_server, "decrypt_drop_content", return_value="should not be needed") as decrypt_mock,
+        ):
+            result = tools_server.search_drops("loneliness")
+
+        self.assertIn("Loneliness in winter", result)
+        self.assertIn("Quiet Channel", result)
+        self.assertNotIn("Loneliness private", result)
+        decrypt_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
