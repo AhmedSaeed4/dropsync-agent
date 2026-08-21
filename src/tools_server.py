@@ -26,6 +26,9 @@ from config import db
 from authz import is_trusted_caller as _is_trusted_caller
 from decrypt import DecryptionCache, decrypt_drop_content, encrypt_drop_content, b64e, b64d, encrypt_personal_drop, encrypt_workspace_drop, _get_workspace_key_data, _decrypt_with_workspace_key, _encrypt_with_workspace_key
 from r2 import fetch_from_r2, fetch_from_r2_by_key, upload_to_r2, delete_from_r2
+# Shared youtubeTitles drawer reader (src/youtube.py) — reused so the label
+# derivation below and the resolve endpoint can never drift apart.
+from youtube import _read_cached_title
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -605,6 +608,37 @@ def _extract_youtube_ids_from_text(text: str) -> list[str]:
             seen.add(vid)
             ids.append(vid)
     return ids
+
+
+def _known_youtube_labels_for(text: str) -> list[dict] | None:
+    """Derive youtubeVideoLabels for a drop text from the shared title cache.
+
+    Cache reads ONLY — zero network requests by design (owner decision: no
+    live YouTube fetch ever runs on a drop-write path; an unknown title is
+    left for later cleanup instead of blocking the save). IDs come from
+    _extract_youtube_ids_from_text — the SAME scanner get_youtube_titles uses,
+    never a second link-parser — capped at the first 50 IDs to mirror the
+    frontend's per-drop limit. Each label carries the frontend's exact shape
+    ({videoId, title<=500 chars non-empty, channel<=200 chars or None}): the
+    browser silently strips malformed labels, so shape compliance is
+    mandatory. Returns the known subset in appearance order (one entry per
+    unique ID), or None when no title is known.
+    """
+    labels: list[dict] = []
+    for video_id in _extract_youtube_ids_from_text(text)[:YOUTUBE_INPUT_LIMIT]:
+        cached = _read_cached_title(video_id)
+        if not cached:
+            continue  # cache miss — omit this video, never fetch it here
+        title = cached.get("title")
+        channel = cached.get("channel")
+        if not (isinstance(title, str) and title.strip()):
+            continue
+        labels.append({
+            "videoId": video_id,
+            "title": title.strip()[:500],
+            "channel": channel.strip()[:200] if isinstance(channel, str) and channel.strip() else None,
+        })
+    return labels if labels else None
 
 
 def _fetch_missing_titles(misses: list[str], deadline: float, cap: int = YOUTUBE_FETCH_CAP) -> tuple[dict[str, dict], int, bool, int]:
@@ -1616,6 +1650,15 @@ def create_drop(
     if reminder_patch and reminder_patch.get("reminderAt") is not None:
         doc_data.update(reminder_patch)
 
+    # Saved-video labels: attach whatever the shared title cache already knows
+    # for links in this content. The agent flow calls get_youtube_titles before
+    # saving (its instructions forbid guessing titles), so the cache is warm
+    # here almost always. Cache reads only — never a live YouTube fetch on a
+    # write path; unknown titles are omitted and left to later cleanup.
+    labels = _known_youtube_labels_for(content)   # plaintext param — extraction ignores encryption
+    if labels:
+        doc_data["youtubeVideoLabels"] = labels
+
     # Write to Firestore
     doc_ref = db.collection("drops").add(doc_data)
 
@@ -2005,13 +2048,21 @@ def update_drop(
                 return "Failed to encrypt content. User encryption keys may not be set up."
             update_data.update(encrypted)
 
-    # Labels describe the current name/content.  The agent's Admin SDK update
-    # path must not leave a title attached to a video that was replaced.  The
-    # normal app path resolves the new labels; an agent edit can be recovered by
-    # the user's explicit backfill action.  This touches only the feature-owned
-    # field and never rewrites existing content or encryption fields.
-    if name is not None or content is not None:
-        update_data["youtubeVideoLabels"] = firestore.DELETE_FIELD
+    # Labels describe the current CONTENT. A name-only edit cannot change which
+    # videos a drop links to, so existing tags stay valid — leave the field
+    # completely alone (a rename no longer destroys saved titles). When the
+    # content changed, re-derive the tags from the shared title cache: known
+    # titles attach immediately (no wipe-and-wait for cleanup), and when
+    # nothing is known (links removed, or all unknown) keep the DELETE_FIELD
+    # wipe — stale tags must not describe videos the drop no longer contains.
+    # Cache reads only; never a live YouTube fetch on a write path. This
+    # touches only the feature-owned field and never rewrites existing content
+    # or encryption fields.
+    if content is not None:
+        labels = _known_youtube_labels_for(content)   # plaintext param — extraction ignores encryption
+        update_data["youtubeVideoLabels"] = (
+            labels if labels else firestore.DELETE_FIELD
+        )
 
     # Nothing to update
     if not update_data:
