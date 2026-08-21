@@ -101,7 +101,13 @@ class ListDropsTests(unittest.TestCase):
         ):
             result = tools_server.list_drops()
 
-        self.assertEqual(result, "formatted\nformatted")
+        # The count header (PR #27) must lead the list: models miscount long
+        # lists, so the computed total is printed up top. 2 live drops, both
+        # text; the expired one is excluded before counting.
+        self.assertEqual(
+            result,
+            "2 personal drops (2 text, 0 file; password and expired drops not included):\nformatted\nformatted",
+        )
         self.assertEqual(decrypt_mock.call_count, 2)
         first_cache = decrypt_mock.call_args_list[0].kwargs["cache"]
         second_cache = decrypt_mock.call_args_list[1].kwargs["cache"]
