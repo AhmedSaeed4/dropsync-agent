@@ -1,4 +1,6 @@
+import os
 import sys
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -78,6 +80,17 @@ def _existing_labeled_drop():
 
 
 class YouTubeResolverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._api_key_patcher = patch.dict(os.environ, {"YOUTUBE_API_KEY": ""})
+        cls._api_key_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._api_key_patcher.stop()
+        super().tearDownClass()
+
     def test_normalize_video_ids_validates_and_deduplicates(self):
         self.assertEqual(
             youtube.normalize_video_ids(["abc12345678", "abc12345678", "bad"]),
@@ -323,6 +336,194 @@ class _KnownLabelsHelperTests(unittest.TestCase):
         with patch.object(tools_server, "_read_cached_title") as read_mock:
             self.assertIsNone(tools_server._known_youtube_labels_for("just words"))
         read_mock.assert_not_called()
+
+
+class YouTubeDataApiTests(unittest.TestCase):
+    """The official Data API front-runs oEmbed wherever fresh fetches happen."""
+
+    def test_helper_without_key_returns_none_without_http(self):
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": ""}),
+            patch.object(youtube, "_http_get_json") as http_mock,
+        ):
+            self.assertIsNone(youtube.fetch_youtube_titles_data_api(["abc12345678"]))
+        http_mock.assert_not_called()
+
+    def test_helper_maps_snippets_trims_and_skips_unusable(self):
+        payload = {
+            "items": [
+                {"id": "abc12345678", "snippet": {"title": "  Padded title  ", "channelTitle": " Chan "}},
+                {"id": "def23456789", "snippet": {"title": "   ", "channelTitle": "Ghost"}},
+                {"snippet": {"title": "No id here"}},
+            ],
+        }
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": "k"}),
+            patch.object(youtube, "_http_get_json", return_value=(payload, 200, None)) as http_mock,
+        ):
+            result = youtube.fetch_youtube_titles_data_api(
+                ["abc12345678", "def23456789", "zzz98765432"]
+            )
+
+        self.assertEqual(result, {"abc12345678": {"title": "Padded title", "channel": "Chan"}})
+        requested_url = http_mock.call_args.args[0]
+        self.assertTrue(requested_url.startswith("https://www.googleapis.com/youtube/v3/videos?"))
+        self.assertIn("id=abc12345678,def23456789,zzz98765432", requested_url)
+
+    def test_helper_returns_none_on_bad_payload_or_status(self):
+        for bad in ((None, None, "boom"), ({"items": "nope"}, 200, None), ({"items": []}, 500, None)):
+            with (
+                patch.dict(os.environ, {"YOUTUBE_API_KEY": "k"}),
+                patch.object(youtube, "_http_get_json", return_value=bad),
+            ):
+                self.assertIsNone(youtube.fetch_youtube_titles_data_api(["abc12345678"]))
+
+    def test_resolve_api_hits_are_cached_and_misses_fall_back_to_oembed(self):
+        payload = {"items": [{"id": "abc12345678", "snippet": {"title": "API title", "channelTitle": "Chan A"}}]}
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": "k"}),
+            patch.object(youtube, "_read_cached_title", return_value=None),
+            patch.object(youtube, "_http_get_json", return_value=(payload, 200, None)),
+            patch.object(youtube, "_merge_cached_title") as merge_mock,
+            patch.object(
+                youtube,
+                "fetch_youtube_title",
+                return_value=("Oembed title", "Chan B", None, 200),
+            ) as fetch_mock,
+        ):
+            result = youtube.resolve_video_ids(["abc12345678", "def23456789"])
+
+        merge_mock.assert_any_call("abc12345678", "API title", "Chan A")
+        self.assertEqual(merge_mock.call_count, 2)
+        fetch_mock.assert_called_once_with(
+            "def23456789",
+            attempt_timeout=youtube.YOUTUBE_RESOLVE_ATTEMPT_TIMEOUT,
+            retry_on_timeout=False,
+        )
+        self.assertEqual(
+            result["labels"][0],
+            {"videoId": "abc12345678", "title": "API title", "channel": "Chan A", "source": "api"},
+        )
+        self.assertEqual(result["labels"][1]["title"], "Oembed title")
+
+    def test_resolve_without_key_keeps_the_legacy_oembed_only_path(self):
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": ""}),
+            patch.object(youtube, "_read_cached_title", return_value=None),
+            patch.object(youtube, "_merge_cached_title"),
+            patch.object(
+                youtube,
+                "fetch_youtube_title",
+                return_value=("Oembed title", None, None, 200),
+            ) as fetch_mock,
+            patch.object(youtube, "_http_get_json") as api_mock,
+        ):
+            result = youtube.resolve_video_ids(["abc12345678"])
+
+        api_mock.assert_not_called()
+        fetch_mock.assert_called_once()
+        self.assertEqual(result["labels"][0]["title"], "Oembed title")
+
+    def test_resolve_with_api_failure_falls_back_to_oembed(self):
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": "k"}),
+            patch.object(youtube, "_read_cached_title", return_value=None),
+            patch.object(youtube, "_merge_cached_title"),
+            patch.object(youtube, "_http_get_json", return_value=(None, None, "boom")),
+            patch.object(
+                youtube,
+                "fetch_youtube_title",
+                return_value=("Oembed title", None, None, 200),
+            ) as fetch_mock,
+        ):
+            result = youtube.resolve_video_ids(["abc12345678"])
+
+        fetch_mock.assert_called_once()
+        self.assertEqual(result["labels"][0]["title"], "Oembed title")
+
+
+class RecordingCacheDB(SingleCollectionDB):
+    """Records youtubeTitles cache writes so tests can prove persistence."""
+
+    def __init__(self):
+        super().__init__(FakeDropCollection())
+        self.cache_sets: dict[str, dict] = {}
+
+    def collection(self, name):
+        if name == tools_server.YOUTUBE_CACHE_COLLECTION:
+            parent = self
+
+            class _CacheColl:
+                def document(self, doc_id):
+                    class _CacheDoc:
+                        def set(self, doc_data, **_kwargs):
+                            parent.cache_sets[doc_id] = doc_data
+                    return _CacheDoc()
+            return _CacheColl()
+        return super().collection(name)
+
+
+class AgentMissingTitlesApiTests(unittest.TestCase):
+    """get_youtube_titles' fetch stage prefers the batched Data API too."""
+
+    def test_api_hits_answer_cache_writes_and_leftovers_use_oembed(self):
+        database = RecordingCacheDB()
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": "k"}),
+            patch.object(tools_server, "db", database),
+            patch.object(
+                tools_server,
+                "fetch_youtube_titles_data_api",
+                return_value={"abc12345678": {"title": "API title", "channel": "Chan A"}},
+            ) as api_mock,
+            patch.object(tools_server, "_fetch_youtube_description", return_value="A preview") as desc_mock,
+            patch.object(
+                tools_server,
+                "_fetch_youtube_title",
+                return_value=("Oembed title", "Chan B", None),
+            ) as fetch_mock,
+        ):
+            results, fetched, throttled, pending = tools_server._fetch_missing_titles(
+                ["abc12345678", "def23456789"], time.monotonic() + 30
+            )
+
+        api_mock.assert_called_once_with(["abc12345678", "def23456789"])
+        desc_mock.assert_any_call("abc12345678")
+        fetch_mock.assert_called_once_with("def23456789")
+        self.assertEqual(results["abc12345678"]["status"], "fetched")
+        self.assertEqual(results["abc12345678"]["desc"], "A preview")
+        self.assertEqual(results["def23456789"]["status"], "fetched")
+        self.assertEqual(results["def23456789"]["title"], "Oembed title")
+        self.assertEqual(fetched, 1)
+        self.assertFalse(throttled)
+        self.assertEqual(pending, 0)
+        cache_doc = database.cache_sets["abc12345678"]
+        self.assertEqual(cache_doc["title"], "API title")
+        self.assertEqual(cache_doc["author_name"], "Chan A")
+        self.assertEqual(cache_doc["descriptionPreview"], "A preview")
+
+    def test_no_key_leaves_the_whole_loop_as_before(self):
+        database = RecordingCacheDB()
+        with (
+            patch.dict(os.environ, {"YOUTUBE_API_KEY": ""}),
+            patch.object(tools_server, "db", database),
+            patch.object(tools_server, "fetch_youtube_titles_data_api", return_value=None) as api_mock,
+            patch.object(
+                tools_server,
+                "_fetch_youtube_title",
+                return_value=("Oembed title", "Chan B", None),
+            ) as fetch_mock,
+        ):
+            results, fetched, throttled, pending = tools_server._fetch_missing_titles(
+                ["abc12345678"], time.monotonic() + 30
+            )
+
+        api_mock.assert_called_once_with(["abc12345678"])
+        fetch_mock.assert_called_once_with("abc12345678")
+        self.assertEqual(fetched, 1)
+        self.assertFalse(throttled)
+        self.assertEqual(pending, 0)
+        self.assertEqual(list(database.cache_sets), ["abc12345678"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ YouTube's keyless oEmbed endpoint through ``requests``.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -169,6 +170,53 @@ def _merge_cached_title(video_id: str, title: str, channel: str | None) -> None:
         logger.warning("YouTube title cache write failed: %s", type(exc).__name__)
 
 
+def fetch_youtube_titles_data_api(video_ids: list[str]) -> dict[str, dict[str, Any]] | None:
+    """Fetch titles/channels for several IDs in ONE YouTube Data API request.
+
+    Dormant until ``YOUTUBE_API_KEY`` exists in the environment. Returns
+    ``{video_id: {"title": str<=500, "channel": str<=200 | None}}`` for every
+    video found; IDs absent from the response are left out (callers treat them
+    as unavailable, like an oEmbed 4xx today). Returns None when no key is set
+    or anything about the request or payload fails — callers keep their oEmbed
+    fallbacks unchanged. Never raises.
+    """
+    api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not api_key or not video_ids:
+        return None
+    url = (
+        "https://www.googleapis.com/youtube/v3/videos?part=snippet"
+        f"&id={','.join(video_ids)}&key={api_key}"
+    )
+    try:
+        data, status, _error = _http_get_json(url)
+        if status != 200 or not isinstance(data, dict):
+            return None
+        items = data.get("items")
+        if not isinstance(items, list):
+            return None
+        results: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            video_id = item.get("id")
+            snippet = item.get("snippet")
+            if not isinstance(video_id, str) or not video_id or not isinstance(snippet, dict):
+                continue
+            title = snippet.get("title")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            channel = snippet.get("channelTitle")
+            if not isinstance(channel, str) or not channel.strip():
+                channel = None
+            else:
+                channel = channel.strip()[:200]
+            results[video_id] = {"title": title.strip()[:500], "channel": channel}
+        return results
+    except Exception as exc:
+        logger.warning("YouTube Data API titles request failed: %s", type(exc).__name__)
+        return None
+
+
 def resolve_video_ids(
     video_ids: list[Any],
     *,
@@ -193,6 +241,20 @@ def resolve_video_ids(
             labels.append(cached)
         else:
             misses.append(video_id)
+
+    api_results = fetch_youtube_titles_data_api(misses)
+    if api_results:
+        for api_video_id, api_hit in api_results.items():
+            _merge_cached_title(api_video_id, api_hit["title"], api_hit["channel"])
+            labels.append(
+                {
+                    "videoId": api_video_id,
+                    "title": api_hit["title"],
+                    "channel": api_hit["channel"],
+                    "source": "api",
+                }
+            )
+        misses = [vid for vid in misses if vid not in api_results]
 
     deadline = time.monotonic() + max(1.0, time_budget)
     fetched = 0

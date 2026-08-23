@@ -28,7 +28,7 @@ from decrypt import DecryptionCache, decrypt_drop_content, encrypt_drop_content,
 from r2 import fetch_from_r2, fetch_from_r2_by_key, upload_to_r2, delete_from_r2
 # Shared youtubeTitles drawer reader (src/youtube.py) — reused so the label
 # derivation below and the resolve endpoint can never drift apart.
-from youtube import _read_cached_title
+from youtube import _read_cached_title, fetch_youtube_titles_data_api
 from datetime import datetime, timezone, timedelta
 from firebase_admin import firestore
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -644,6 +644,9 @@ def _known_youtube_labels_for(text: str) -> list[dict] | None:
 def _fetch_missing_titles(misses: list[str], deadline: float, cap: int = YOUTUBE_FETCH_CAP) -> tuple[dict[str, dict], int, bool, int]:
     """Fetch uncached video titles from YouTube — capped, paced, budget-bound.
 
+    When YOUTUBE_API_KEY is set, one batched Data API request answers first;
+    only the IDs it could not resolve enter the capped/paced oEmbed loop.
+
     Used by get_youtube_titles. A 429 (slow down) stops
     the batch early. Successful fetches are cached in Firestore (description
     preview too, when the dormant key path is active); failures are NOT cached —
@@ -656,6 +659,27 @@ def _fetch_missing_titles(misses: list[str], deadline: float, cap: int = YOUTUBE
     results: dict[str, dict] = {}
     fetched = 0
     throttled = False
+
+    api_hits = fetch_youtube_titles_data_api(misses)
+    if api_hits:
+        for vid, hit in api_hits.items():
+            title = hit["title"]
+            channel = hit["channel"]
+            desc = _fetch_youtube_description(vid)
+            results[vid] = {"title": title, "channel": channel, "desc": desc, "status": "fetched"}
+            try:
+                cache_doc = {
+                    "videoId": vid,
+                    "title": title,
+                    "author_name": channel if isinstance(channel, str) else None,
+                    "fetchedAt": firestore.SERVER_TIMESTAMP,
+                }
+                if desc:
+                    cache_doc["descriptionPreview"] = desc
+                db.collection(YOUTUBE_CACHE_COLLECTION).document(vid).set(cache_doc)
+            except Exception:
+                pass  # best-effort — the answer still returns, just isn't remembered
+        misses = [vid for vid in misses if vid not in api_hits]
     for i, vid in enumerate(misses):
         if throttled or fetched >= cap or time.monotonic() >= deadline:
             for rest_vid in misses[i:]:
