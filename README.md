@@ -18,6 +18,8 @@ The frontend's in-app AI assistant (chat panel → AI tab) talks to this service
 - Chat with your drops using natural language — search, list, preview, create, update, move, copy, and delete text drops
 - Create workspaces with auto-generated invite codes; join by invite code
 - Fuzzy search — handles typos and misspellings across names, content, and categories
+- YouTube title intelligence — looks up real titles for YouTube links, attaches them to drops for native title/channel search, and can save a YouTube link as a drop (with the user's OK first)
+- Resilient runs — replies stream to the UI as they generate, chats run as resumable jobs that survive disconnects, and a stopped run reports exactly what it accomplished
 - Enforces per-workspace access control (personal drops are owner-only; workspace drops require membership)
 - Sets, changes, and clears in-app reminders on text drops
 - Password-category drops are protected by a three-layer defense (input guardrail + hard tool-level block + per-tool access checks)
@@ -74,12 +76,18 @@ Key design points:
 | `list_categories` | List categories with live drop-usage counts (personal or per-workspace) |
 | `delete_category` | Delete a custom category (built-ins `password`/`link` cannot be deleted) |
 | `get_storage_stats` | Storage stats with per-workspace breakdown (password drops counted, content hidden) |
+| `get_youtube_titles` | Fetch the real title and channel of YouTube videos from links (cached permanently for native video search) |
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/chat` | POST | Run the agent on a message + conversation history (Firebase auth required) |
+| `/chat/stream` | POST | Run the agent with a streamed response so the UI can show live activity |
+| `/chat/runs` | POST | Start a resumable agent run that survives disconnects |
+| `/chat/runs/{run_id}/stream` | GET | Reconnect to a running run's event stream |
+| `/chat/runs/{run_id}/cancel` | POST | Cancel a running run |
+| `/youtube/resolve-labels` | POST | Resolve YouTube titles/labels for a batch of links (used by the frontend's backfill sweep) |
 | `/health` | GET | Health check — returns `{"status": "ok", "model": "<live model>"}` |
 
 ### Chat Request
@@ -239,7 +247,7 @@ Set the environment variables above as **Secrets** on the Space (API_KEY, BASE_U
 src/
 ├── main.py          # FastAPI app: /chat + /health, auth, quota gate, per-request MCP subprocess
 ├── agent.py         # Agents: DropSync Assistant, DropSync Knowledge, PasswordGuardrail
-├── tools_server.py  # MCP tools server (stdio): 15 tools over Firestore
+├── tools_server.py  # MCP tools server (stdio): 16 tools over Firestore
 ├── decrypt.py       # AES-256-GCM + ECDH decryption/encryption (personal + workspace keys)
 ├── authz.py         # Trusted-tier check (owner / tier == 'trusted'), fail-closed
 ├── usage_limit.py   # Rolling per-user message quota (5/hr + 25/day) via Firestore transactions
