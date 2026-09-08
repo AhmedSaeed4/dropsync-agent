@@ -1682,6 +1682,14 @@ def create_drop(
     labels = _known_youtube_labels_for(content)   # plaintext param — extraction ignores encryption
     if labels:
         doc_data["youtubeVideoLabels"] = labels
+    if labels:
+        # D7 sticky signal: this account now has a YouTube-link drop.
+        try:
+            db.collection("users").document(user_id).set(
+                {"hasYoutubeDrops": True}, merge=True
+            )
+        except Exception:
+            pass  # best-effort; never blocks the save
 
     # Write to Firestore
     doc_ref = db.collection("drops").add(doc_data)
@@ -2087,6 +2095,14 @@ def update_drop(
         update_data["youtubeVideoLabels"] = (
             labels if labels else firestore.DELETE_FIELD
         )
+        if labels:
+            # D7 sticky signal: an edit can introduce the account's first link.
+            try:
+                db.collection("users").document(user_id).set(
+                    {"hasYoutubeDrops": True}, merge=True
+                )
+            except Exception:
+                pass  # best-effort
 
     # Nothing to update
     if not update_data:
