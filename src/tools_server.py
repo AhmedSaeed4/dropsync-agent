@@ -121,6 +121,11 @@ def _is_expired_drop(d: dict, now: datetime) -> bool:
 
 
 ACCESS_DENIED_WORKSPACE = "Access denied — you're not a member of this workspace."
+# ROUND 12: members are fully locked out of a workspace mid background deletion.
+WORKSPACE_DELETING_DENIED = (
+    "That workspace is being deleted — it can no longer be used. "
+    "It will disappear for everyone once the deletion finishes."
+)
 
 
 def _is_workspace_member(user_id: str | None, workspace_id: str | None) -> bool:
@@ -158,6 +163,25 @@ def _is_workspace_member(user_id: str | None, workspace_id: str | None) -> bool:
     # Guard against a corrupted non-list members field (a string would make `in`
     # a substring match). Deny unless it's a real list containing us.
     return isinstance(members, list) and user_id in members
+
+
+def _workspace_deleting(workspace_id: str | None) -> bool:
+    """ROUND 12: True when workspace_id names a workspace mid background deletion
+    (frozen job fields; members locked out). Personal context (None/''/'none') is never
+    deleting. FAIL-OPEN by design: a missing doc, a Firestore error, or a malformed flag
+    reads as NOT deleting — the client firestore.rules are the lockout authority and this
+    helper is defense-in-depth for the Admin SDK (which bypasses rules); the deleting
+    window is short and self-healing. Never raises.
+    """
+    if not workspace_id or not isinstance(workspace_id, str) or workspace_id.lower() == "none":
+        return False
+    try:
+        ws_doc = db.collection("workspaces").document(workspace_id).get()
+    except Exception:
+        return False
+    if not ws_doc.exists:
+        return False
+    return (ws_doc.to_dict() or {}).get("deleting") is True
 
 
 def _resolve_reminder(
@@ -737,6 +761,9 @@ def list_drops(workspace_id: str | None = None) -> str:
         # bypasses firestore.rules, so workspace access must be enforced here.
         if not _is_workspace_member(user_id, workspace_id):
             return ACCESS_DENIED_WORKSPACE
+        # ROUND 12: a workspace mid background deletion is locked — refuse the listing.
+        if _workspace_deleting(workspace_id):
+            return WORKSPACE_DELETING_DENIED
         # No userId filter — all members see all drops in the workspace
         docs = db.collection("drops").where("workspaceId", "==", workspace_id).stream()
     else:
@@ -817,6 +844,8 @@ def search_drops(query: str) -> str:
     decryption_cache = DecryptionCache(firestore_timeout=SEARCH_FIRESTORE_TIMEOUT_SECONDS)
     workspace_name_cache: dict[str, str] = {}
     documents, incomplete = _get_all_accessible_drops(user_id, deadline)
+    # ROUND 12: result-phase deleting re-check cache (one read per workspace, reused).
+    workspace_deleting_cache: dict[str, bool] = {}
 
     for doc in documents:
         if time.monotonic() >= deadline:
@@ -829,6 +858,14 @@ def search_drops(query: str) -> str:
 
         # Skip password-category drops
         if _is_password_drop(d):
+            continue
+
+        # ROUND 12 result-phase re-check: a workspace may have STARTED deleting after the
+        # drops were gathered — its drops vanish from the results (fail-open per the gate).
+        d_ws = d.get("workspaceId")
+        if d_ws and d_ws not in workspace_deleting_cache:
+            workspace_deleting_cache[d_ws] = _workspace_deleting(d_ws)
+        if d_ws and workspace_deleting_cache[d_ws]:
             continue
 
         name = d.get("name", "")
@@ -977,12 +1014,21 @@ def delete_drop(drop_id: str) -> str:
     if ws_id:
         if not _is_workspace_member(user_id, ws_id):
             return ACCESS_DENIED_WORKSPACE
+        # ROUND 12: no agent deletes inside a workspace mid background deletion — the
+        # deletion runner owns its teardown.
+        if _workspace_deleting(ws_id):
+            return WORKSPACE_DELETING_DENIED
     else:
         if d.get("userId") != user_id:
             return "Access denied — you can only delete your own drops."
 
     if _is_password_drop(d):
         return PASSWORD_DENIED
+
+    # ROUND 12: call drops are system records owned by the call lifecycle routes — the
+    # agent never deletes them (the deletion runner force-ends + resolves calls itself).
+    if d.get("type") == "call":
+        return "Call drops can't be deleted through the assistant — the call system manages them."
 
     doc_ref.delete()
     return f"Deleted drop '{d.get('name', drop_id)}'."
@@ -1059,6 +1105,10 @@ def move_drop(drop_id: str, target_workspace_id: str) -> str:
     # Verify membership in target workspace
     if not _is_workspace_member(user_id, target_workspace_id):
         return "Access denied — you're not a member of the target workspace."
+
+    # ROUND 12: refuse when either end is mid background deletion (members are locked out).
+    if _workspace_deleting(source_ws) or _workspace_deleting(target_workspace_id):
+        return WORKSPACE_DELETING_DENIED
 
     # Block password drops
     if _is_password_drop(d):
@@ -1240,6 +1290,9 @@ def copy_drop(drop_id: str, target_workspace_id: str) -> str:
         return "Access denied — you're not a member of the source workspace."
     if not _is_workspace_member(user_id, target_workspace_id):
         return "Access denied — you're not a member of the target workspace."
+    # ROUND 12: refuse when either end is mid background deletion (members are locked out).
+    if _workspace_deleting(source_ws) or _workspace_deleting(target_workspace_id):
+        return WORKSPACE_DELETING_DENIED
     if _is_password_drop(d):
         return PASSWORD_DENIED
     if d.get("type") != "text":
@@ -1583,6 +1636,9 @@ def create_drop(
     # Personal drops (workspace_id None) are created under the caller's own userId.
     if not _is_workspace_member(user_id, workspace_id):
         return ACCESS_DENIED_WORKSPACE
+    # ROUND 12: no new drops into a workspace mid background deletion.
+    if workspace_id and _workspace_deleting(workspace_id):
+        return WORKSPACE_DELETING_DENIED
 
     # Parse categories from comma-separated string
     category_list = []
@@ -1760,6 +1816,17 @@ def create_workspace(name: str) -> str:
     if not name.strip():
         return "Workspace name cannot be empty."
 
+    # ROUND 12 (part K): refuse while the caller's own account-deletion barrier holds —
+    # mirrors the firestore.rules create admission (barrierBlocks). Fail-open on a read
+    # error (defense-in-depth; the account drain consumes any workspace this misses).
+    try:
+        barrier_doc = db.collection("accountBarriers").document(user_id).get()
+        if barrier_doc.exists and (barrier_doc.to_dict() or {}).get("state") in ("active", "completing", "finalizing"):
+            return ("Your account is being deleted — new workspaces can't be created. "
+                    "Finish or cancel the account deletion first.")
+    except Exception:
+        pass
+
     # Create workspace document
     invite_code = _generate_invite_code()
     doc_ref = db.collection("workspaces").add({
@@ -1810,6 +1877,11 @@ def join_workspace(invite_code: str) -> str:
     members = ws_data.get("members", [])
     if user_id in members:
         return f"You're already a member of '{ws_data.get('name', 'unnamed')}' workspace."
+
+    # ROUND 12: a deleting workspace is frozen — no new members (the doc is already in
+    # hand; no extra read). Mirrors the /api/workspaces/join admission.
+    if ws_data.get("deleting") is True:
+        return "That workspace is being deleted and can no longer be joined."
 
     # Add user to members
     updated_members = members + [user_id]
@@ -1917,6 +1989,9 @@ def delete_category(category_id: str) -> str:
         # Workspace category — verify membership
         if not _is_workspace_member(user_id, ws_id):
             return ACCESS_DENIED_WORKSPACE
+        # ROUND 12: the deletion runner's categories stage owns these now.
+        if _workspace_deleting(ws_id):
+            return WORKSPACE_DELETING_DENIED
     else:
         # Personal category — must be creator
         if created_by != user_id:
@@ -1974,6 +2049,10 @@ def update_drop(
     else:
         if d.get("userId") != user_id:
             return "Access denied — you can only update your own drops."
+
+    # ROUND 12: no updates inside a workspace mid background deletion.
+    if ws_id and _workspace_deleting(ws_id):
+        return WORKSPACE_DELETING_DENIED
 
     # Block password drops
     if _is_password_drop(d):
