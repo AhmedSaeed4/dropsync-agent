@@ -2010,15 +2010,20 @@ def update_drop(
     expiration: str | None = None,
     reminder: str | None = None,
 ) -> str:
-    """Update an existing text drop. Can update name, content, categories, and/or expiration.
-    - For personal drops: content updates trigger re-encryption with a new DEK.
-    - For workspace drops: content updates re-encrypt with the workspace key.
+    """Update an existing text or file drop.
+    - Text drops: name, content, categories, expiration, and/or reminder.
+    - File drops: METADATA ONLY — name, categories, and/or expiration. Content and
+      reminders are text-drop features (the app's own file-drop edit offers the same
+      three fields); the file bytes are never editable through the assistant.
+    - For personal text drops: content updates trigger re-encryption with a new DEK.
+    - For workspace text drops: content updates re-encrypt with the workspace key.
     - Password-category drops cannot be updated.
     - Supports up to 3 categories per drop (comma-separated).
     Args:
         drop_id: ID of the drop to update.
         name: New name for the drop (optional).
-        content: New text content (optional, triggers re-encryption).
+        content: New text content (optional, triggers re-encryption). Text drops
+            only — rejected for file drops.
         categories: Comma-separated list of up to 3 category names (e.g. 'link,anime'). Pass '' to remove all.
         expiration: New expiration: '1h', '2h', '6h', '24h', 'forever' (optional).
         reminder: Optional. Set/change a reminder with a compact duration ('15m','1h','1d',...).
@@ -2037,9 +2042,12 @@ def update_drop(
 
     d = doc.to_dict()
 
-    # Only text drops can be updated
-    if d.get("type") != "text":
-        return "Only text drops can be updated through the assistant."
+    # Text and file drops can be updated — file drops are metadata-only (the
+    # content/reminder rejection just below enforces it). Call drops stay
+    # agent-untouchable: system records owned by the call lifecycle routes (the
+    # same boundary delete_drop uses), and any other type is denied too.
+    if d.get("type") not in ("text", "file"):
+        return "Only text and file drops can be updated through the assistant."
 
     # Access control
     ws_id = d.get("workspaceId")
@@ -2057,6 +2065,17 @@ def update_drop(
     # Block password drops
     if _is_password_drop(d):
         return PASSWORD_DENIED
+
+    # File drops: metadata-only. Both rejections must run BEFORE the first Firestore
+    # write in this tool (the categories block below auto-creates category docs — the
+    # same zero-orphan-write ordering the reminder and forever gates use).
+    if d.get("type") == "file":
+        if content is not None:
+            return ("A file drop's content can't be edited through the assistant — only its "
+                    "name, categories, and expiration can change. Use the DropSync app to "
+                    "replace the file itself.")
+        if reminder is not None:
+            return "File drops can't carry a reminder — reminders are a text-drop feature."
 
     update_data: dict = {}
 
