@@ -15,7 +15,7 @@ The frontend's in-app AI assistant (chat panel → AI tab) talks to this service
 
 ## What It Does
 
-- Chat with your drops using natural language — search, list, preview, create, update, move, copy, and delete text drops
+- Chat with your drops using natural language — search, list, preview, create, update, move, copy, and delete drops (updates cover text drops fully; file drops: list, preview, metadata update, delete)
 - Create workspaces with auto-generated invite codes; join by invite code
 - Fuzzy search — handles typos and misspellings across names, content, and categories
 - YouTube title intelligence — looks up real titles for YouTube links, attaches them to drops for native title/channel search, and can save a YouTube link as a drop (with the user's OK first)
@@ -66,7 +66,7 @@ Key design points:
 | `get_drop` | Full details of a specific drop, including decrypted content |
 | `preview_drop` | Open a drop in the frontend UI preview (returns drop id + workspace id) |
 | `create_drop` | Create a new encrypted text drop (categories, expiration, optional reminder) |
-| `update_drop` | Update a text drop's name, content (re-encrypted), categories, expiration, and/or reminder |
+| `update_drop` | Update a text or file drop — text: name, content (re-encrypted), categories, expiration, and/or reminder; file (metadata only): name, categories, expiration |
 | `delete_drop` | Delete a drop (requires explicit user confirmation, per agent rules) |
 | `move_drop` | Move a text drop between workspaces — content and attached images re-encrypted, categories preserved |
 | `copy_drop` | Duplicate a text drop into another workspace, original untouched |
